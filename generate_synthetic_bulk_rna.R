@@ -59,7 +59,9 @@ if (n_cond == 2) {
 # -----------------------------
 # Base gene means (on counts) — heavy-tailed like RNA-seq:
 # Draw base log2 mean, then convert
-base_log2_mu <- rnorm(n_genes, mean = 1.5, sd = 1.25)  # ~ 2^1.5 ≈ 2.8 counts baseline (pre library factor)
+
+# ~ 2^1.5 ≈ 2.8 counts baseline (pre library factor)
+base_log2_mu <- rnorm(n_genes, mean = 1.5, sd = 1.25)
 base_mu      <- pmax(2^(base_log2_mu), 1e-6)
 
 # Gene-wise dispersion (NB): variance = mu + mu^2/size; size ~= 1/phi
@@ -73,7 +75,8 @@ size <- 1 / pmax(phi, 1e-8)
 is_de <- rbinom(n_genes, 1, de_prop) == 1
 lfc_mat <- matrix(0, nrow = n_genes, ncol = n_cond)
 colnames(lfc_mat) <- paste0("C", seq_len(n_cond))
-# Reference condition C1 has 0 by construction; others get random LFCs on DE genes
+# Reference condition C1 has 0 by construction;
+# others get random LFCs on DE genes
 for (k in 2:n_cond) {
   # symmetric up/down regulation; continuous LFCs
   lfc <- rnorm(n_genes, mean = 0, sd = de_lfc_sd)
