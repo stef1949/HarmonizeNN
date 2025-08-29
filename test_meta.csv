@@ -1,0 +1,5 @@
+sample,batch,label
+s1,A,case
+s2,A,ctrl
+s3,B,case
+s4,B,ctrl
