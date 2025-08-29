@@ -2,8 +2,6 @@
 
 An adversarial autoencoder for bulk RNA-seq batch effect correction. It learns a latent representation that preserves biological signal (optional supervised head) while discouraging batch-specific variation via a gradient reversal adversary. Outputs a batch-corrected expression matrix (logCPM scale) and optional latent embedding plus visual diagnostics.
 
-> Suggested short name: BatchAlign (feel free to rename in this README).
-
 ---
 ## Key Features
 - Counts → library-size normalisation → CPM → log1p
