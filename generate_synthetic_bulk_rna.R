@@ -103,14 +103,14 @@ sample_lib_factor <- 2^(rnorm(n_samples, mean = 0, sd = libsize_sd))
 # -----------------------------
 # Build per-sample gene-wise means (mu_ij)
 # -----------------------------
-# mu_ij = base_mu * 2^(lfc_condition[gene, cond_j]) * 2^(batch_lfc_gene[gene, batch_j]) * libsize_batch_j * libsize_sample_j
+# mu_ij = base_mu * 2^(lfc_condition[gene, cond_j]) * 2^(batch_lfc_gene[gene, batch_j]) * libsize_batch_j * libsize_sample_j # nolint: line_length_linter, line_length_linter, commented_code_linter.
 mu <- matrix(0, nrow = n_genes, ncol = n_samples)
 for (j in seq_len(n_samples)) {
   bj <- as.integer(batches[j])
   cj <- as.integer(condition[j])
   # gene-specific effects
   log2_mu_j <- log2(base_mu) + lfc_mat[, cj] + batch_lfc_gene[, bj]
-  mu[, j] <- pmax(2^(log2_mu_j), 1e-12) * batch_lib_shift[bj] * sample_lib_factor[j]
+  mu[, j] <- pmax(2^(log2_mu_j), 1e-12) * batch_lib_shift[bj] * sample_lib_factor[j] # nolint: line_length_linter.
 }
 
 # -----------------------------
@@ -146,7 +146,7 @@ meta <- data.frame(
 )
 write.csv(meta, file = out_meta, row.names = FALSE)
 
-message(sprintf("Wrote %s  (genes x samples = %d x %d)", out_counts, nrow(counts), ncol(counts)))
+message(sprintf("Wrote %s  (genes x samples = %d x %d)", out_counts, nrow(counts), ncol(counts))) # nolint: line_length_linter.
 message(sprintf("Wrote %s  (batches=%d, conditions=%d, samples=%d)",
                 out_meta, nlevels(batches), nlevels(condition), nrow(meta)))
 message("Non-confounded by construction: each batch contains all conditions.")

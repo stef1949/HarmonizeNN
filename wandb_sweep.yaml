@@ -1,0 +1,122 @@
+################################################################################
+# Improved Weights & Biases Sweep configuration for NN batch correction
+# Key changes:
+#  - Optimises objective_score (composite) directly
+#  - Adds early_stop_metric & log_latent_every to command (latent plots disabled for speed)
+#  - Uses log-uniform search for learning rate; keeps modest categorical for others
+#  - HyperBand early termination for faster pruning
+#  - Slightly narrower adaptive margin ranges (search focuses on realistic band)
+################################################################################
+
+program: NN_batch_correct.py
+project: nn-batch-correction
+method: bayes   # alternatives: random, grid
+metric:
+  name: objective_score
+  goal: maximize
+
+early_terminate:
+  type: hyperband
+  min_iter: 12         # a bit earlier than before (model converges fast)
+  s: 2
+
+command:
+  - ${env}
+  - C:/Users/stef1/OneDrive/Documents/vscode/NNBatchCorrection/.venv/Scripts/python.exe
+  - NN_batch_correct.py
+  - --counts
+  - bulk_counts.csv
+  - --metadata
+  - sample_meta.csv
+  - --genes_in_rows
+  - --sample_col
+  - sample
+  - --batch_col
+  - batch
+  - --label_col
+  - condition
+  - --epochs
+  - 200
+  - --out_corrected
+  - corrected_logcpm.csv
+  - --out_latent
+  - latent.csv
+  - --use_wandb
+  - --wandb_log
+  - none
+  - --early_stop_metric
+  - objective_score
+  - --log_latent_every
+  - 50
+  - --patience
+  - 25
+  - --min_epochs
+  - 150
+  - --early_stop_delta
+  - 0.002
+  - ${args}
+
+parameters:
+  # Fixed / categorical architectural choices
+  hvg:
+    values: [3000, 5000, 8000]
+  latent_dim:
+    values: [16, 32, 48]
+  enc_hidden:
+    values: ["1024,256", "1024,512,128", "2048,512"]
+  dec_hidden:
+    values: ["256,1024", "128,512,1024", "512,2048"]
+  adv_hidden:
+    values: ["128", "256,64"]
+  sup_hidden:
+    values: ["64", "128"]
+  scheduler:
+    values: [cosine, none]
+  recon_loss:
+    values: [mse, huber]
+  adv_lambda_schedule:
+    values: [adaptive, sigmoid]
+
+  # Continuous / probabilistic
+  dropout:
+    distribution: uniform
+    min: 0.05
+    max: 0.30
+  lr:
+    distribution: log_uniform_values  # actual value bounds (was log_uniform with exponent misunderstanding)
+    min: 0.0001
+    max: 0.0010
+  weight_decay:
+    values: [0.0, 1e-5, 1e-4]   # small discrete set usually enough
+
+  # Loss balancing
+  adv_weight:
+    values: [0.8, 1.0, 1.3, 1.6, 2.0]
+  sup_weight:
+    values: [0.8, 1.0, 1.3, 1.6]
+
+  # Training dynamics
+  batch_size:
+    values: [16, 32, 48]
+  adaptive_high_margin:
+    values: [0.15, 0.20, 0.25]
+  adaptive_low_margin:
+    values: [0.03, 0.05, 0.07]
+
+  # Logging cadence (kept fixed for speed)
+  wandb_log_freq:
+    value: 1
+
+  # Patience remains fixed in script; can expose if needed:
+  # patience:
+  #   values: [15, 25]
+
+  # Early stop metric & latent logging fixed via command; not swept.
+
+################################################################################
+# Notes:
+# - objective_score: label_acc - val_loss - |batch_acc - target|
+# - Keeping latent visualisations off during sweep (can re-run best run with --log_latent_every 1)
+# - For exploration speed you can drop largest enc/dec layers or reduce epochs.
+# - Add amp / pin_memory flags later if GPU stable.
+################################################################################
