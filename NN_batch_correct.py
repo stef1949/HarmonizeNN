@@ -266,6 +266,7 @@ def train_model(
     recon_loss: str = "mse",
     use_amp: bool = False,
     scheduler_type: str = "none",
+    warmup_ratio: float = 0.1,
     grad_accum_steps: int = 1,
     adaptive_high_margin: float = 0.20,
     adaptive_low_margin: float = 0.05,
@@ -316,6 +317,17 @@ def train_model(
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5, min_lr=1e-6)
     elif scheduler_type == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    elif scheduler_type == "cosine_warmup":
+        import math
+        steps_per_epoch = max(1, (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps)
+        total_steps = max(1, epochs * steps_per_epoch)
+        warmup_steps = max(1, int(total_steps * warmup_ratio))
+        def lr_lambda(step: int):
+            if step < warmup_steps:
+                return float(step) / float(warmup_steps)
+            progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
     else:
         scheduler = None
 
@@ -395,6 +407,8 @@ def train_model(
                 else:
                     opt.step()
                 opt.zero_grad(set_to_none=True)
+                if scheduler_type == "cosine_warmup" and scheduler is not None:
+                    scheduler.step()
 
             train_loss += loss.item() * Xb.size(0)
 
@@ -406,7 +420,7 @@ def train_model(
         all_b_true, all_b_pred = [], []
         all_l_true, all_l_pred = [], []
         all_z = []
-    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled and torch.cuda.is_available()):
+        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled and torch.cuda.is_available()):
             for batch in val_loader:
                 if len(batch) == 2:
                     Xb, Bb = batch
@@ -475,8 +489,8 @@ def train_model(
             except Exception:
                 pass
 
-        # Scheduler step
-        if scheduler is not None:
+        # Scheduler step (epoch-based for plateau/cosine; per-step for cosine_warmup handled during training)
+        if scheduler is not None and scheduler_type in ("plateau", "cosine"):
             if scheduler_type == "plateau":
                 scheduler.step(val_loss)
             else:
@@ -845,7 +859,8 @@ def main():
     ap.add_argument("--adaptive_down_scale", default=0.95, type=float, help="Multiplicative factor to decrease lambda when adversary too strong")
     ap.add_argument("--adaptive_up_scale", default=1.05, type=float, help="Multipliclicative factor to increase lambda when adversary too weak")
     ap.add_argument("--weight_decay", default=0.0, type=float, help="Weight decay (L2) for AdamW optimizer")
-    ap.add_argument("--scheduler", default="none", choices=["none", "plateau", "cosine"], help="Learning rate scheduler")
+    ap.add_argument("--scheduler", default="none", choices=["none", "plateau", "cosine", "cosine_warmup"], help="Learning rate scheduler")
+    ap.add_argument("--warmup_ratio", default=0.1, type=float, help="Linear warmup ratio for cosine_warmup scheduler")
     ap.add_argument("--recon_loss", default="mse", choices=["mse", "mae", "huber"], help="Reconstruction loss type")
     ap.add_argument("--amp", action="store_true", help="Enable mixed precision (AMP) training on CUDA")
     ap.add_argument("--dropout", default=0.1, type=float, help="Dropout probability for all MLPs")
@@ -1129,6 +1144,7 @@ def main():
             recon_loss=args.recon_loss,
             use_amp=args.amp,
             scheduler_type=args.scheduler,
+            warmup_ratio=args.warmup_ratio,
             grad_accum_steps=args.grad_accum,
             adaptive_high_margin=args.adaptive_high_margin,
             adaptive_low_margin=args.adaptive_low_margin,

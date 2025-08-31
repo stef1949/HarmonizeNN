@@ -68,7 +68,7 @@ parameters:
   num_workers:
     value: 6
   scheduler:
-    values: ["plateau", "cosine", "cosine_warmup"]
+    value: cosine_warmup
   warmup_ratio:
     value: 0.05
   grad_accum:

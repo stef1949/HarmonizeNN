@@ -63,7 +63,9 @@ parameters:
   pin_memory:
     value: true
   scheduler:
-    values: ["plateau", "cosine"]
+    value: cosine_warmup
+  warmup_ratio:
+    value: 0.05
   log_latent_every:
     value: 20
   viz_hvg_top:

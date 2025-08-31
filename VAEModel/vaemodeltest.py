@@ -77,6 +77,20 @@ def standardize_per_gene(df: pd.DataFrame) -> Tuple[pd.DataFrame, StandardScaler
     X = scaler.fit_transform(df.values)
     return pd.DataFrame(X, index=df.index, columns=df.columns), scaler
 
+def safe_silhouette(X, labels):
+    # Need >=2 distinct labels and no label with all samples
+    if X.shape[0] < 3:
+        return 0.0
+    uniq = np.unique(labels)
+    if len(uniq) < 2:
+        return 0.0
+    # Require at least one sample in two clusters
+    try:
+        return silhouette_score(X, labels, metric="euclidean")
+    except Exception:
+        return 0.0
+
+# (Silhouette metrics are computed after each validation epoch once latent vectors are collected.)
 
 # ----------------------------
 # Data & Model Components
@@ -223,7 +237,8 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                 sup_weight: float, kl_weight: float, use_amp: bool, scheduler_type: str,
                 patience: int, device: torch.device, save_best_path: Optional[Path] = None,
                 wandb_run: Optional[object] = None, batch_classes: Optional[list] = None,
-                log_latent_every: int = 0, grad_accum_steps: int = 1, warmup_ratio: float = 0.1):
+                log_latent_every: int = 0, grad_accum_steps: int = 1, warmup_ratio: float = 0.1,
+                log_lr_steps: bool = False):
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -285,7 +300,7 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                 if scheduler and scheduler_type == 'cosine_warmup':
                     scheduler.step()
                 # Per-step logging
-                if (globals().get('args', None) and getattr(args, 'log_lr_steps', False)) or (wandb_run and getattr(wandb_run, 'config', None) and getattr(wandb_run.config, 'log_lr_steps', False)):
+                if log_lr_steps or (wandb_run and getattr(wandb_run, 'config', None) and getattr(wandb_run.config, 'log_lr_steps', False)):
                     lr_now = opt.param_groups[0]['lr']
                     try:
                         if wandb_run:
@@ -294,6 +309,10 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                             print(f"Step {optimizer_steps:06d} LR {lr_now:.2e} Loss {float(total_loss.detach()):.4f}")
                     except Exception:
                         pass
+                elif not wandb_run:
+                    # Lightweight optional console logging every 200 optimizer steps when not using W&B
+                    if optimizer_steps % 200 == 0:
+                        print(f"Step {optimizer_steps:06d} Loss {float(total_loss.detach()):.4f}")
 
         # Validation
         model.eval()
@@ -324,6 +343,25 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
         b_acc = accuracy_score(all_b_true, all_b_pred)
         l_acc = accuracy_score(all_l_true, all_l_pred) if all_l_true else np.nan
 
+        # Compute silhouette metrics on latent space (only after validation collections)
+        try:
+            all_z_np = np.concatenate(all_z, axis=0)
+            all_b_np = np.array(all_b_true)
+            if all_z_np.shape[0] > 2:
+                batch_sil = safe_silhouette(all_z_np, all_b_np)
+                if all_l_true:
+                    all_l_np = np.array(all_l_true)
+                    cond_sil = safe_silhouette(all_z_np, all_l_np)
+                else:
+                    cond_sil = 0.0
+                cond_minus_batch = cond_sil - batch_sil
+            else:
+                batch_sil = 0.0
+                cond_sil = 0.0
+                cond_minus_batch = 0.0
+        except Exception:
+            batch_sil = cond_sil = cond_minus_batch = 0.0
+
         t1 = time.time()
         current_lr = opt.param_groups[0]['lr']
         print(f"E {epoch+1:03d} | VLoss {val_loss:.4f} | BAcc {b_acc:.3f}" + (f" | LAcc {l_acc:.3f}" if not np.isnan(l_acc) else "") + f" | LR {current_lr:.2e} | Time {t1-t0:.2f}s")
@@ -349,6 +387,14 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                 except Exception as e:
                     print(f"[WARN] Latent viz failed: {e}")
             wandb_run.log(log_dict)
+            wandb_run.log({
+                "val/cond_sil": cond_sil,
+                "val/batch_sil": batch_sil,
+                "val/cond_minus_batch": cond_minus_batch,
+                "epoch": epoch + 1,
+                "val/loss": val_loss,
+                # keep existing logged losses (recon, kl, adv, sup) if you track them
+            })
 
         if val_loss < best_val_loss:
             best_val_loss, wait = val_loss, 0
@@ -561,12 +607,12 @@ def main():
     ap.add_argument("--attention_heads", default=4, type=int)
     ap.add_argument("--epochs", default=200, type=int)
     ap.add_argument("--lr", default=1e-3, type=float)
-    ap.add_argument("--batch_size", default=128, type=int)
+    ap.add_argument("--batch_size", default=256, type=int)
     ap.add_argument("--adv_weight", default=1.0, type=float)
     ap.add_argument("--sup_weight", default=1.0, type=float)
     ap.add_argument("--kl_weight", default=0.001, type=float)
     ap.add_argument("--weight_decay", default=0.0, type=float)
-    ap.add_argument("--scheduler", default="plateau", choices=["none", "plateau", "cosine", "cosine_warmup"], help="LR scheduler (cosine_warmup adds linear warmup + cosine decay)")
+    ap.add_argument("--scheduler", default="cosine_warmup", choices=["none", "plateau", "cosine", "cosine_warmup"], help="LR scheduler (cosine_warmup adds linear warmup + cosine decay)")
     ap.add_argument("--warmup_ratio", default=0.1, type=float, help="Fraction of total optimizer steps used for linear warmup (cosine_warmup only)")
     ap.add_argument("--amp", action="store_true", help="Enable Mixed Precision Training")
     ap.add_argument("--dropout", default=0.1, type=float)
@@ -575,8 +621,8 @@ def main():
     ap.add_argument("--out_latent", type=Path, default=None)
     ap.add_argument("--out_shap", type=Path, default=None)
     ap.add_argument("--save_model_path", type=Path, default="best_model.pt")
-    ap.add_argument("--num_workers", default=4, type=int, help="DataLoader workers (increase to improve pipeline overlap)")
-    ap.add_argument("--prefetch_factor", default=2, type=int, help="DataLoader prefetch factor (default 2; increase for large GPU)")
+    ap.add_argument("--num_workers", default=6, type=int, help="DataLoader workers (increase to improve pipeline overlap)")
+    ap.add_argument("--prefetch_factor", default=12, type=int, help="DataLoader prefetch factor (default 2; increase for large GPU)")
     ap.add_argument("--pin_memory", action="store_true", help="Pin memory for faster host->GPU transfer")
     ap.add_argument("--log_latent_every", default=0, type=int, help="Log latent PCA to W&B every N epochs (0=disable)")
     ap.add_argument("--compile", action="store_true", help="Use torch.compile for model (PyTorch 2.x)")
@@ -739,7 +785,8 @@ def main():
                       adv_weight=args.adv_weight, sup_weight=args.sup_weight, kl_weight=args.kl_weight,
                       use_amp=args.amp, scheduler_type=args.scheduler, patience=args.patience,
                       save_best_path=args.save_model_path, wandb_run=wandb_run, batch_classes=batch_cats.cat.categories.tolist(), device=device,
-                      log_latent_every=args.log_latent_every, grad_accum_steps=args.grad_accum, warmup_ratio=args.warmup_ratio)
+                      log_latent_every=args.log_latent_every, grad_accum_steps=args.grad_accum, warmup_ratio=args.warmup_ratio,
+                      log_lr_steps=args.log_lr_steps)
     model = fit["model"]
     t_train_end = time.time()
     print(f"[TIMING] load={t_load1-t_load0:.2f}s preprocess={t_proc-t_load1:.2f}s train_total={t_train_end-t_proc:.2f}s")

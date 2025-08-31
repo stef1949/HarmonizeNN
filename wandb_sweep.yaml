@@ -71,7 +71,7 @@ parameters:
   sup_hidden:
     values: ["64", "128"]
   scheduler:
-    values: ["cosine", "none"]
+  value: cosine_warmup
   recon_loss:
     values: ["mse", "huber"]
   adv_lambda_schedule:

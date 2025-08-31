@@ -120,7 +120,9 @@ parameters:
   num_workers:
     value: 4
   scheduler:
-    values: ["plateau", "cosine"]
+    value: cosine_warmup
+  warmup_ratio:
+    value: 0.05
   log_latent_every:
     value: 20
   viz_hvg_top:
