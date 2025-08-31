@@ -1,7 +1,8 @@
 # Neural Network Batch Correction (Adversarial Autoencoder)
 
 <p align=center>
-<img src="logCPM_boxplots.png" alt="LogCPM Boxplots" width="400" align=center />
+<img src="logCPM_boxplots.png" alt="LogCPM Boxplots" height="300" align=center />
+<img src="VAEModel/pca_panel.png" alt="Before & After PCA Plots" height="300" align=center />
 </p>
 
 An adversarial autoencoder for bulk RNA-seq batch effect correction. It learns a latent representation that preserves biological signal (optional supervised head) while discouraging batch-specific variation via a gradient reversal adversary. Outputs a batch-corrected expression matrix (logCPM scale) and optional latent embedding plus visual diagnostics.
