@@ -369,7 +369,8 @@ def train_model(
             Bb = Bb.to(device, non_blocking=True)
             Lb = Lb.to(device, non_blocking=True) if Lb is not None else None
 
-            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+            # Only enable autocast when CUDA is available to avoid noisy warnings on CPU-only setups
+            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled and torch.cuda.is_available()):
                 x_hat, b_logits, l_logits, _ = model(Xb, adv_lambda=lam)
                 loss = recon_loss_fn(x_hat, Xb) + ce_batch(b_logits, Bb)
                 if l_logits is not None and Lb is not None:
@@ -405,7 +406,7 @@ def train_model(
         all_b_true, all_b_pred = [], []
         all_l_true, all_l_pred = [], []
         all_z = []
-        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled and torch.cuda.is_available()):
             for batch in val_loader:
                 if len(batch) == 2:
                     Xb, Bb = batch

@@ -1,0 +1,86 @@
+program: VAEModel/vaemodeltest.py
+method: bayes
+metric:
+  name: cond_minus_batch
+  goal: maximize
+command:
+  - ${env}
+  - c:/Users/stef1/OneDrive/Documents/vscode/NNBatchCorrection/.venv/Scripts/python.exe
+  - ${program}
+  - --use_wandb
+  - --amp
+  - --pin_memory
+  - --fast_start
+  # Uncomment next line to enforce GPU usage and abort if missing
+  # - --require_cuda
+  - ${args}
+parameters:
+  counts:
+    value: VAEModel/synthetic_counts.csv
+  metadata:
+    value: VAEModel/synthetic_metadata.csv
+  sample_col:
+    value: sample
+  batch_col:
+    value: batch
+  label_col:
+    value: condition
+  out_corrected:
+    value: VAEModel/sweep_corrected.csv
+  out_latent:
+    value: VAEModel/sweep_latent.csv
+  viz_pca_panel:
+    value: VAEModel/sweep_pca_panel.png
+  epochs:
+    value: 120
+  patience:
+    value: 25
+  hvg:
+    values: [3000, 5000]
+  latent_dim:
+    values: [16, 24, 32]
+  enc_hidden:
+    values: ["1024,256", "1024,512,256"]
+  dec_hidden:
+    values: ["256,1024", "256,512,1024"]
+  adv_hidden:
+    values: ["128", "256"]
+  sup_hidden:
+    values: ["64", "128"]
+  adv_weight:
+    min: 1.0
+    max: 5.0
+  sup_weight:
+    min: 0.5
+    max: 2.0
+  kl_weight:
+    distribution: log_uniform_values
+    min: 0.0005
+    max: 0.01
+  dropout:
+    values: [0.1, 0.2, 0.3]
+  lr:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.002
+  batch_size:
+    values: [64, 96, 128]
+  num_workers:
+    value: 6
+  scheduler:
+    values: ["plateau", "cosine", "cosine_warmup"]
+  warmup_ratio:
+    value: 0.05
+  grad_accum:
+    value: 4
+  log_latent_every:
+    value: 5
+  viz_hvg_top:
+    value: 2000
+  seed:
+    values: [42, 1337]
+  cache_dir:
+    value: VAEModel/cache
+early_terminate:
+  type: hyperband
+  min_iter: 20

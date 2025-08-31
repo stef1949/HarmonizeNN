@@ -1,0 +1,134 @@
+program: vaemodeltest.py
+method: bayes
+metric:
+  name: cond_minus_batch
+  goal: maximize
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --use_wandb
+  - --counts
+  - ${counts}
+  - --metadata
+  - ${metadata}
+  - --sample_col
+  - ${sample_col}
+  - --batch_col
+  - ${batch_col}
+  - --label_col
+  - ${label_col}
+  - --out_corrected
+  - ${out_corrected}
+  - --out_latent
+  - ${out_latent}
+  - --generate_viz
+  - --viz_pca_panel
+  - ${viz_pca_panel}
+  - --epochs
+  - ${epochs}
+  - --patience
+  - ${patience}
+  - --hvg
+  - ${hvg}
+  - --latent_dim
+  - ${latent_dim}
+  - --enc_hidden
+  - ${enc_hidden}
+  - --dec_hidden
+  - ${dec_hidden}
+  - --adv_hidden
+  - ${adv_hidden}
+  - --sup_hidden
+  - ${sup_hidden}
+  - --adv_weight
+  - ${adv_weight}
+  - --sup_weight
+  - ${sup_weight}
+  - --kl_weight
+  - ${kl_weight}
+  - --dropout
+  - ${dropout}
+  - --lr
+  - ${lr}
+  - --batch_size
+  - ${batch_size}
+  - --amp
+  - --num_workers
+  - ${num_workers}
+  - --pin_memory
+  - --scheduler
+  - ${scheduler}
+  - --log_latent_every
+  - ${log_latent_every}
+  - --viz_hvg_top
+  - ${viz_hvg_top}
+  - --seed
+  - ${seed}
+  - --compile
+parameters:
+  counts:
+    value: synthetic_counts.csv
+  metadata:
+    value: synthetic_metadata.csv
+  sample_col:
+    value: sample
+  batch_col:
+    value: batch
+  label_col:
+    value: condition
+  out_corrected:
+    value: sweep_corrected.csv
+  out_latent:
+    value: sweep_latent.csv
+  viz_pca_panel:
+    value: sweep_pca_panel.png
+  epochs:
+    value: 120
+  patience:
+    value: 25
+  hvg:
+    values: [3000, 5000]
+  latent_dim:
+    values: [16, 24, 32]
+  enc_hidden:
+    values: ["1024,256", "1024,512,256"]
+  dec_hidden:
+    values: ["256,1024", "256,512,1024"]
+  adv_hidden:
+    values: ["128", "256"]
+  sup_hidden:
+    values: ["64", "128"]
+  adv_weight:
+    min: 1.0
+    max: 5.0
+  sup_weight:
+    min: 0.5
+    max: 2.0
+  kl_weight:
+    distribution: log_uniform_values
+    min: 0.0005
+    max: 0.01
+  dropout:
+    values: [0.1, 0.2, 0.3]
+  lr:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.002
+  batch_size:
+    values: [64, 96, 128]
+  num_workers:
+    value: 4
+  scheduler:
+    values: ["plateau", "cosine"]
+  log_latent_every:
+    value: 20
+  viz_hvg_top:
+    value: 2000
+  seed:
+    values: [42, 1337]
+  amp:
+    value: true
+early_terminate:
+  type: hyperband
+  min_iter: 20

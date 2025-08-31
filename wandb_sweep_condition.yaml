@@ -1,0 +1,75 @@
+program: VAEModel/vaemodeltest.py
+method: bayes
+metric:
+  name: cond_minus_batch
+  goal: maximize
+parameters:
+  counts:
+    value: bulk_counts.csv
+  metadata:
+    value: sample_meta.csv
+  sample_col:
+    value: sample
+  batch_col:
+    value: batch
+  label_col:
+    value: condition
+  out_corrected:
+    value: sweep_corrected.csv
+  out_latent:
+    value: sweep_latent.csv
+  generate_viz:
+    value: true
+  viz_pca_panel:
+    value: sweep_pca_panel.png
+  epochs:
+    value: 120
+  patience:
+    value: 25
+  hvg:
+    values: [3000, 5000]
+  latent_dim:
+    values: [16, 24, 32]
+  enc_hidden:
+    values: ["1024,256", "1024,512,256"]
+  dec_hidden:
+    values: ["256,1024", "256,512,1024"]
+  adv_hidden:
+    values: ["128", "256"]
+  sup_hidden:
+    values: ["64", "128"]
+  adv_weight:
+    min: 1.0
+    max: 5.0
+  sup_weight:
+    min: 0.5
+    max: 2.0
+  kl_weight:
+    distribution: log_uniform_values
+    min: 0.0005
+    max: 0.01
+  dropout:
+    values: [0.1, 0.2, 0.3]
+  lr:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.002
+  batch_size:
+    values: [64, 96, 128]
+  amp:
+    value: true
+  num_workers:
+    value: 4
+  pin_memory:
+    value: true
+  scheduler:
+    values: ["plateau", "cosine"]
+  log_latent_every:
+    value: 20
+  viz_hvg_top:
+    value: 2000
+  seed:
+    values: [42, 1337]
+early_terminate:
+  type: hyperband
+  min_iter: 20
