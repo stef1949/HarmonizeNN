@@ -5,3 +5,4 @@ matplotlib>=3.7.0
 torch>=2.1.0
 umap-learn>=0.5.5 # optional, latent viz fallback to PCA if absent
 wandb>=0.16.0 # optional logging
+shap>=0.45.0

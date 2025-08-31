@@ -3,16 +3,21 @@
 """
 Neural network-based batch correction for bulk RNA-seq.
 
-Pipeline:
-1) Read counts and metadata
-2) Library-size normalize -> CPM -> log1p
-3) Optional highly-variable gene (HVG) selection
-4) Per-gene standardization (z-score) for training stability
-5) Train autoencoder with gradient-reversal batch adversary
-   (optional supervised head to preserve biological labels)
-6) Export batch-corrected matrix in logCPM scale
+Enhanced pipeline (supports AE and VAE+Attention with optional NB loss):
+1) Read counts + metadata
+2) Library-size normalise -> CPM -> log1p (used for HVG selection only)
+3) HVG selection (train-only variance when splitting)
+4) AE path: per-gene standardisation of logCPM (z-score) for stability
+    VAE+NB path (--model_type vae_attention --use_nb_loss): uses raw counts (HVG subset) directly
+5) Train model with gradient-reversal batch adversary (+ optional supervised label head)
+    - AE: reconstruction losses (MSE/MAE/Huber) on standardized logCPM
+    - VAE: negative binomial reconstruction (counts) + KL
+6) Export corrected matrix:
+    - AE: inverse-standardised back to logCPM scale
+    - VAE+NB: decoder mean (count space) (user can transform downstream)
+7) Optional latent embedding CSV, SHAP (VAE attention), visualisations
 
-Author: Steph Ritchie
+Author: Steph Ritchie (original) – extended for VAE/Attention + NB path
 License: MIT
 """
 
@@ -28,6 +33,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -43,6 +49,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score, accuracy_score
 from sklearn.model_selection import train_test_split
+
+# Optional SHAP import will be delayed (only if requested)
+
+try:
+    from vae_attention_model import VaeAttentionBatchCorrector
+except Exception:
+    VaeAttentionBatchCorrector = None  # type: ignore
 
 # -------- Global perf toggles (safe no-ops if unsupported) --------
 try:
@@ -265,6 +278,7 @@ def train_model(
     early_stop_delta: float = 0.0,
     wandb_run: Optional[object] = None,
     batch_classes: Optional[list] = None,
+    label_classes: Optional[list] = None,
 ) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -534,19 +548,39 @@ def train_model(
                 try:
                     import wandb
                     cmap = plt.get_cmap('tab10')
+                    # First layer: batches with colors
                     if batch_classes is not None:
                         unique_codes = np.unique(codes)
                         for c in unique_codes:
                             mask = codes == c
                             label = batch_classes[int(c)] if int(c) < len(batch_classes) else str(int(c))
                             color = cmap(int(c) % cmap.N)
-                            ax.scatter(emb[mask, 0], emb[mask, 1], color=color, s=20, label=label, alpha=0.9)
-                        ax.legend(loc='best', fontsize='small', markerscale=1.2)
+                            ax.scatter(emb[mask, 0], emb[mask, 1], color=color, s=24, label=label, alpha=0.88)
+                        batch_legend = ax.legend(title='batch', loc='upper left', fontsize='x-small', markerscale=1.0, frameon=True)
+                        ax.add_artist(batch_legend)
                     else:
-                        ax.scatter(emb[:, 0], emb[:, 1], c=codes, cmap='tab10', s=18)
+                        ax.scatter(emb[:, 0], emb[:, 1], c=codes, cmap='tab10', s=22, alpha=0.9)
+
+                    # Second overlay: label classes as distinct marker shapes (unfilled)
+                    if label_classes is not None and all_l_true:
+                        label_codes = np.concatenate(all_l_true)
+                        if len(np.unique(label_codes)) > 1:
+                            from matplotlib.lines import Line2D
+                            markers = ["o", "s", "^", "D", "v", "P", "X", "*", ">", "<"]
+                            label_handles = []
+                            for i, lc in enumerate(np.unique(label_codes)):
+                                m = markers[i % len(markers)]
+                                mask = label_codes == lc
+                                ax.scatter(
+                                    emb[mask, 0], emb[mask, 1],
+                                    facecolors='none', edgecolors='k', marker=m, s=70, linewidths=1.0, alpha=0.95
+                                )
+                                lbl = label_classes[int(lc)] if int(lc) < len(label_classes) else str(int(lc))
+                                label_handles.append(Line2D([0], [0], marker=m, linestyle='None', markerfacecolor='none', markeredgecolor='k', label=lbl))
+                            ax.legend(handles=label_handles, title='label', loc='lower right', fontsize='x-small', frameon=True)
+
                     ax.set_title(f"Epoch {epoch+1} latent")
                     ax.set_xticks([]); ax.set_yticks([])
-                    # log image with step so each epoch image is stored in the run history
                     wandb_run.log({"latent_plot": wandb.Image(fig)}, step=epoch + 1)
                 except Exception:
                     pass
@@ -787,8 +821,8 @@ def load_inputs(
 
 def main():
     ap = argparse.ArgumentParser(description="Neural network bulk RNA-seq batch correction (adversarial autoencoder).")
-    ap.add_argument("--counts", required=True, type=Path, help="Counts matrix CSV (genes x samples OR samples x genes). Index=feature or sample names.")
-    ap.add_argument("--metadata", required=True, type=Path, help="Sample metadata CSV with at least [sample,batch].")
+    ap.add_argument("--counts", default=None, type=Path, help="Counts matrix CSV (genes x samples OR samples x genes). If omitted, will look for 'bulk_counts.csv'.")
+    ap.add_argument("--metadata", default=None, type=Path, help="Sample metadata CSV with at least [sample,batch]. If omitted, will look for 'sample_meta.csv'.")
     ap.add_argument("--sample_col", default="sample", type=str, help="Column in metadata that has sample IDs.")
     ap.add_argument("--batch_col", default="batch", type=str, help="Column in metadata that has batch IDs.")
     ap.add_argument("--label_col", default=None, type=str, help="Optional biological label column (condition).")
@@ -822,7 +856,7 @@ def main():
     ap.add_argument("--early_stop_delta", default=0.0, type=float, help="Minimum improvement required to reset patience (direction depends on metric)")
     ap.add_argument("--seed", default=42, type=int)
     ap.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2+) for speed")
-    ap.add_argument("--out_corrected", required=True, type=Path, help="Output CSV path for corrected matrix (logCPM scale).")
+    ap.add_argument("--out_corrected", default=None, type=Path, help="Output CSV path for corrected matrix (logCPM scale). Defaults to 'corrected_logcpm.csv' if omitted.")
     ap.add_argument("--out_latent", default=None, type=Path, help="Optional CSV for latent embedding.")
     ap.add_argument("--save_model", default=None, type=Path, help="Optional path to save trained model .pt")
     ap.add_argument("--use_wandb", action="store_true", help="Log training and artifacts to Weights & Biases")
@@ -832,6 +866,16 @@ def main():
     ap.add_argument("--label_values", default=None, type=str, help="Optional comma-separated expected label values that must appear in each batch (e.g. 'tumor,normal'). If not set, each batch must contain >=2 unique labels when --label_col is provided.")
     ap.add_argument("--early_stop_metric", default="val_loss", choices=["val_loss", "val_batch_acc", "val_sup_acc", "objective_score"], help="Metric to monitor for early stopping.")
     ap.add_argument("--log_latent_every", default=1, type=int, help="Log latent embedding plot every N epochs (0=disable).")
+    # New model variants / VAE+Attention
+    ap.add_argument("--model_type", default="ae", choices=["ae", "vae_attention"], help="Base model: adversarial AE or VAE with attention.")
+    ap.add_argument("--vae_hidden_dim", default=256, type=int, help="Hidden dim for VAE attention encoder/decoder.")
+    ap.add_argument("--vae_attention_dim", default=128, type=int, help="Self-attention d_model for gene tokens.")
+    ap.add_argument("--vae_attn_heads", default=4, type=int, help="Number of attention heads.")
+    ap.add_argument("--vae_dispersion", default="gene", choices=["gene", "global", "gene-batch"], help="Dispersion parameterisation for NB loss.")
+    ap.add_argument("--vae_beta", default=1.0, type=float, help="KL weight (beta-VAE).")
+    ap.add_argument("--use_nb_loss", action="store_true", help="(VAE only) Indicates inputs should approximate counts for NB loss.")
+    ap.add_argument("--out_shap", default=None, type=Path, help="Optional: path to write SHAP mean |value| per gene CSV (VAE attention model only).")
+    ap.add_argument("--attn_max_tokens", default=2000, type=int, help="Cap sequence length for attention via pooling (VAE attention).")
     # Visualization after training
     ap.add_argument("--generate_viz", action="store_true", help="Generate PCA and boxplot visualisations after training using the visualiser module")
     ap.add_argument("--viz_hvg_top", default=2000, type=int, help="Top-N most variable genes to use for PCA visualisations (0=use all)")
@@ -839,6 +883,25 @@ def main():
     ap.add_argument("--viz_pca_after", default="pca_after.png", type=str, help="Output path for PCA after correction")
     ap.add_argument("--viz_boxplot", default="logCPM_boxplots.png", type=str, help="Output path for logCPM boxplots")
     args = ap.parse_args()
+
+    # -------- Fallbacks for omitted required-style arguments --------
+    if args.counts is None:
+        default_counts = Path("bulk_counts.csv")
+        if default_counts.exists():
+            args.counts = default_counts
+            print(f"[INFO] Using default counts file: {default_counts}")
+        else:
+            raise SystemExit("ERROR: --counts not provided and 'bulk_counts.csv' not found.")
+    if args.metadata is None:
+        default_meta = Path("sample_meta.csv")
+        if default_meta.exists():
+            args.metadata = default_meta
+            print(f"[INFO] Using default metadata file: {default_meta}")
+        else:
+            raise SystemExit("ERROR: --metadata not provided and 'sample_meta.csv' not found.")
+    if args.out_corrected is None:
+        args.out_corrected = Path("corrected_logcpm.csv")
+        print(f"[INFO] Using default output path: {args.out_corrected}")
 
 
     set_seed(args.seed)
@@ -906,12 +969,27 @@ def main():
 
     # HVG selection on TRAIN ONLY (applied to all rows)
     logcpm = select_hvg_train_only(logcpm, train_ix, args.hvg)
+    hvg_genes = logcpm.columns.tolist()
 
-    # Standardize per gene: fit on TRAIN ONLY; get TRAIN std and ALL std matrices
+    # Prepare inputs for model paths
+    # AE path (and VAE when not using NB) operates on standardized logCPM
     X_train_std, X_all_std, scaler = standardize_per_gene_fit_transform(logcpm, train_ix)
-
-    # Slice back out VAL std matrix using indices
     X_val_std = X_all_std[val_ix]
+
+    # For VAE with NB loss we want non-negative count-like inputs (avoid z-scored negatives)
+    if args.model_type == "vae_attention" and args.use_nb_loss:
+        counts_hvg = counts_raw[hvg_genes].astype(float).values
+        # Simple library-size normalisation to counts per million without log (still non-negative)
+        lib_sizes = counts_hvg.sum(axis=1, keepdims=True)
+        lib_sizes[lib_sizes == 0] = 1.0
+        counts_cpm = counts_hvg / lib_sizes * 1e6  # scale roughly
+        X_all_input = counts_cpm
+        X_train_input = counts_cpm[train_ix]
+        X_val_input = counts_cpm[val_ix]
+    else:
+        X_all_input = X_all_std
+        X_train_input = X_train_std
+        X_val_input = X_val_std
 
     b_train, b_val = batch_idx[train_ix], batch_idx[val_ix]
     if label_idx is not None:
@@ -925,8 +1003,8 @@ def main():
     sampler = make_weighted_sampler(b_train, l_train, n_labels=n_labels_for_pairs)
 
     # Construct datasets
-    ds_train = RNADataset(X_train_std, b_train, l_train)
-    ds_val = RNADataset(X_val_std, b_val, l_val)
+    ds_train = RNADataset(X_train_input, b_train, l_train)
+    ds_val = RNADataset(X_val_input, b_val, l_val)
 
     # Build DataLoaders (prefetch only if workers>0)
     loader_kwargs = dict(
@@ -942,23 +1020,37 @@ def main():
     dl_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
 
     # Model
-    enc_hidden = tuple(int(x) for x in args.enc_hidden.split(",") if x.strip())
-    dec_hidden = tuple(int(x) for x in args.dec_hidden.split(",") if x.strip())
-    adv_hidden = tuple(int(x) for x in args.adv_hidden.split(",") if x.strip())
-    sup_hidden = tuple(int(x) for x in args.sup_hidden.split(",") if x.strip())
-
-    model = AEBatchCorrector(
-        n_genes=logcpm.shape[1],
-        latent_dim=args.latent_dim,
-        enc_hidden=enc_hidden,
-        dec_hidden=dec_hidden,
-        adv_hidden=adv_hidden,
-        sup_hidden=sup_hidden,
-        n_batches=len(batch_classes),
-        n_labels=(len(label_classes) if label_classes is not None else None),
-        dropout=args.dropout,
-        adv_lambda=args.adv_weight,
-    )
+    if args.model_type == "vae_attention":
+        if VaeAttentionBatchCorrector is None:
+            raise RuntimeError("vae_attention model requested but module not available.")
+        model = VaeAttentionBatchCorrector(
+            num_genes=logcpm.shape[1],
+            num_batches=len(batch_classes),
+            latent_dim=args.latent_dim,
+            hidden_dim=args.vae_hidden_dim,
+            attention_dim=args.vae_attention_dim,
+            n_heads=args.vae_attn_heads,
+            dropout=args.dropout,
+            dispersion=args.vae_dispersion,
+            attn_max_tokens=args.attn_max_tokens,
+        )
+    else:
+        enc_hidden = tuple(int(x) for x in args.enc_hidden.split(",") if x.strip())
+        dec_hidden = tuple(int(x) for x in args.dec_hidden.split(",") if x.strip())
+        adv_hidden = tuple(int(x) for x in args.adv_hidden.split(",") if x.strip())
+        sup_hidden = tuple(int(x) for x in args.sup_hidden.split(",") if x.strip())
+        model = AEBatchCorrector(
+            n_genes=logcpm.shape[1],
+            latent_dim=args.latent_dim,
+            enc_hidden=enc_hidden,
+            dec_hidden=dec_hidden,
+            adv_hidden=adv_hidden,
+            sup_hidden=sup_hidden,
+            n_batches=len(batch_classes),
+            n_labels=(len(label_classes) if label_classes is not None else None),
+            dropout=args.dropout,
+            adv_lambda=args.adv_weight,
+        )
 
     # Optional torch.compile (PyTorch 2+)
     if args.compile:
@@ -980,46 +1072,100 @@ def main():
             print("[W&B] Warning: wandb.watch failed:", e)
 
     # Train
-    fit = train_model(
-        model=model,
-        train_loader=dl_train,
-        val_loader=dl_val,
-        epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        adv_weight=args.adv_weight,
-        sup_weight=args.sup_weight,
-        adv_lambda_schedule=args.adv_lambda_schedule,
-        recon_loss=args.recon_loss,
-        use_amp=args.amp,
-        scheduler_type=args.scheduler,
-        grad_accum_steps=args.grad_accum,
-        adaptive_high_margin=args.adaptive_high_margin,
-        adaptive_low_margin=args.adaptive_low_margin,
-        adaptive_down_scale=args.adaptive_down_scale,
-        adaptive_up_scale=args.adaptive_up_scale,
-        patience=args.patience,
-    early_stop_metric=args.early_stop_metric,
-    log_latent_every=args.log_latent_every,
-    min_epochs=args.min_epochs,
-    early_stop_delta=args.early_stop_delta,
-        wandb_run=wandb_run,
-        batch_classes=batch_classes,
-    )
-    model = fit["model"]
+    if args.model_type == "vae_attention":
+        # Simplified training loop for VAE path (no adversary / labels here)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scaler = None
+        history = {"train_total": [], "train_recon": [], "train_kl": []}
+        for epoch in range(args.epochs):
+            model.train()
+            epoch_tot = epoch_rec = epoch_kl = 0.0
+            for batch in dl_train:
+                if len(batch) == 2:
+                    Xb, Bb = batch
+                else:
+                    Xb, Bb, _ = batch
+                # Xb, Bb are already tensors from Dataset; avoid re-wrapping to silence copy warnings
+                Xb = Xb.to(device=device, dtype=torch.float32, non_blocking=True)
+                Bb = Bb.to(device=device, dtype=torch.long, non_blocking=True)
+                out = model(Xb, Bb)
+                losses = model.vae_loss(out, Xb, beta=args.vae_beta)
+                opt.zero_grad(set_to_none=True)
+                losses["total"].backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                bs = Xb.size(0)
+                epoch_tot += losses["total"].item() * bs
+                epoch_rec += losses["recon"].item() * bs
+                epoch_kl += losses["kl"].item() * bs
+            n_tr = len(dl_train.dataset)
+            history["train_total"].append(epoch_tot / n_tr)
+            history["train_recon"].append(epoch_rec / n_tr)
+            history["train_kl"].append(epoch_kl / n_tr)
+            print(f"[VAE] Epoch {epoch+1}/{args.epochs} total={history['train_total'][-1]:.4f} recon={history['train_recon'][-1]:.4f} kl={history['train_kl'][-1]:.4f}")
+            if wandb_run is not None:
+                try:
+                    wandb_run.log({
+                        "vae_total": history['train_total'][-1],
+                        "vae_recon": history['train_recon'][-1],
+                        "vae_kl": history['train_kl'][-1],
+                    }, step=epoch + 1)
+                except Exception:
+                    pass
+    else:
+        fit = train_model(
+            model=model,
+            train_loader=dl_train,
+            val_loader=dl_val,
+            epochs=args.epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            adv_weight=args.adv_weight,
+            sup_weight=args.sup_weight,
+            adv_lambda_schedule=args.adv_lambda_schedule,
+            recon_loss=args.recon_loss,
+            use_amp=args.amp,
+            scheduler_type=args.scheduler,
+            grad_accum_steps=args.grad_accum,
+            adaptive_high_margin=args.adaptive_high_margin,
+            adaptive_low_margin=args.adaptive_low_margin,
+            adaptive_down_scale=args.adaptive_down_scale,
+            adaptive_up_scale=args.adaptive_up_scale,
+            patience=args.patience,
+            early_stop_metric=args.early_stop_metric,
+            log_latent_every=args.log_latent_every,
+            min_epochs=args.min_epochs,
+            early_stop_delta=args.early_stop_delta,
+            wandb_run=wandb_run,
+            batch_classes=batch_classes,
+            label_classes=label_classes,
+        )
+        model = fit["model"]
 
     # Inference: corrected = decoder(encoder(X)) using TRAIN-fitted scaler
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
     with torch.no_grad():
-        X_all = torch.tensor(X_all_std, dtype=torch.float32, device=device)
-        x_hat, z = model.reconstruct(X_all)  # skip adversary at inference
-        corr_std = x_hat.cpu().numpy()
+        X_all = torch.tensor(X_all_input, dtype=torch.float32, device=device)
+        if args.model_type == "vae_attention":
+            # Need batch indices for reconstruction; reuse encoded full batch order
+            b_idx_full = torch.tensor(batch_idx, dtype=torch.long, device=device)
+            x_hat, z = model.reconstruct(X_all, b_idx_full)
+        else:
+            x_hat, z = model.reconstruct(X_all)  # AE path
+        corr_arr = x_hat.cpu().numpy()
         z_lat = z.cpu().numpy()
 
-    # Inverse standardization -> logCPM scale
-    corr_logcpm = inverse_standardize(corr_std, scaler)
-    corrected_df = pd.DataFrame(corr_logcpm, index=logcpm.index, columns=logcpm.columns)
+    # Output handling differs by path
+    if args.model_type == "vae_attention" and args.use_nb_loss:
+        # Already in (approx) count / CPM space
+        corrected_df = pd.DataFrame(corr_arr, index=logcpm.index, columns=logcpm.columns)
+    else:
+        # AE (or VAE without NB) -> inverse-standardize back to logCPM
+        corr_logcpm = inverse_standardize(corr_arr, scaler)
+        corrected_df = pd.DataFrame(corr_logcpm, index=logcpm.index, columns=logcpm.columns)
     corrected_df.to_csv(args.out_corrected)
     print(f"[OK] Wrote corrected matrix (logCPM) to: {args.out_corrected}")
 
@@ -1051,6 +1197,45 @@ def main():
     sil = quick_silhouettes(z_lat, batch_idx, (label_idx if args.label_col is not None else None))
     print(f"Silhouette (batch)  : {sil['sil_batch']:.3f}" if not np.isnan(sil['sil_batch']) else "Silhouette (batch): NA")
     print(f"Silhouette (label)  : {sil['sil_label']:.3f}" if not np.isnan(sil['sil_label']) else "Silhouette (label): NA")
+
+    # Optional SHAP attribution (VAE only) -- simple mean |SHAP| per gene using gradient explainer fallback
+    if args.out_shap and args.model_type == "vae_attention":
+        try:
+            import shap
+            model.eval()
+            # sample subset for background + evaluation
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            X_tensor = torch.tensor(X_all_std, dtype=torch.float32, device=device)
+            b_tensor = torch.tensor(batch_idx, dtype=torch.long, device=device)
+            # Choose up to 64 background & 128 evaluation samples
+            bg_idx = np.random.choice(X_tensor.size(0), size=min(64, X_tensor.size(0)), replace=False)
+            eval_idx = np.random.choice(X_tensor.size(0), size=min(128, X_tensor.size(0)), replace=False)
+            X_bg = X_tensor[bg_idx]
+            B_bg = b_tensor[bg_idx]
+            X_eval = X_tensor[eval_idx]
+            B_eval = b_tensor[eval_idx]
+
+            def f(inp):
+                # inp shape (N,G); need batches aligning; broadcast first portion of B_eval
+                bs = inp.size(0)
+                b_sub = B_eval[:bs]
+                out = model(inp, b_sub)
+                return out["mu"]
+
+            explainer = shap.DeepExplainer(f, X_bg)
+            shap_vals = explainer.shap_values(X_eval)
+            # shap_vals could be list (for multi-output) or array
+            if isinstance(shap_vals, list):
+                # Average over outputs
+                shap_arr = np.mean([np.abs(sv) for sv in shap_vals], axis=0)
+            else:
+                shap_arr = np.abs(shap_vals)
+            mean_abs = shap_arr.mean(axis=0)
+            shap_df = pd.DataFrame({"gene": corrected_df.columns, "mean_abs_shap": mean_abs})
+            shap_df.to_csv(args.out_shap, index=False)
+            print(f"[OK] Wrote SHAP summary to {args.out_shap}")
+        except Exception as e:
+            print(f"[SHAP] Skipped (error: {e})")
 
     # Optional visualisations
     if args.generate_viz:

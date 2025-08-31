@@ -7,7 +7,7 @@ Usage:
 param(
   [Parameter(Mandatory=$true)][string]$SweepId,
   [int]$MaxRuns = 0,
-  [int]$NumAgents = 3
+  [int]$NumAgents = 1
 )
 
 # Activate local venv if present (must happen after param block in PowerShell scripts)
