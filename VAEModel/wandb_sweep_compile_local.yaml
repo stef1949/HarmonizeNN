@@ -42,9 +42,9 @@ command:
   - --seed=${seed}
 parameters:
   counts:
-    value: ../bulk_counts.csv
+    value: bulk_counts.csv   # relative to project root
   metadata:
-    value: ../sample_meta.csv
+    value: sample_meta.csv
   sample_col:
     value: sample
   batch_col:
@@ -103,8 +103,9 @@ parameters:
     value: 2000
   seed:
     values: [42, 1337]
-  amp:
-    value: true
+  precision:
+    values: [auto, bf16, fp16]
+  # keep amp as constant flag in command; no parameter needed
 early_terminate:
   type: hyperband
   min_iter: 20

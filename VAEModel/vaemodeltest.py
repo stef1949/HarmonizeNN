@@ -237,14 +237,38 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                 sup_weight: float, kl_weight: float, use_amp: bool, scheduler_type: str,
                 patience: int, device: torch.device, save_best_path: Optional[Path] = None,
                 wandb_run: Optional[object] = None, batch_classes: Optional[list] = None,
+                label_classes: Optional[list] = None,
                 log_latent_every: int = 0, grad_accum_steps: int = 1, warmup_ratio: float = 0.1,
-                log_lr_steps: bool = False):
+                log_lr_steps: bool = False, use_fused_optim: bool = False, use_cuda_graphs: bool = False,
+                precision_dtype: torch.dtype = torch.float32,
+                auto_lr: bool = False, auto_lr_metric: str = 'reward', auto_lr_factor: float = 0.5,
+                auto_lr_patience: int = 5, auto_min_lr: float = 1e-6):
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Optimizer (optionally fused AdamW)
+    if use_fused_optim:
+        try:
+            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, fused=True)
+            print("[INFO] Using fused AdamW optimizer")
+        except Exception as e:
+            print(f"[WARN] Fused AdamW unavailable ({e}); falling back to standard AdamW")
+            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     ce = nn.CrossEntropyLoss()
     # Only enable AMP scaler if CUDA is available; avoids noisy warnings on CPU-only systems
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp and torch.cuda.is_available())
+
+    # CUDA Graphs constraints / preparation
+    if use_cuda_graphs and not torch.cuda.is_available():
+        print("[WARN] --cuda_graphs ignored (no CUDA device)")
+        use_cuda_graphs = False
+    if use_cuda_graphs and grad_accum_steps > 1:
+        print("[WARN] Disabling grad accumulation because CUDA Graphs is enabled")
+        grad_accum_steps = 1
+    graph = None
+    static_X = static_B = static_L = None
+    capture_done = False
     # Scheduler setup (adds cosine_warmup)
     if scheduler_type == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5)
@@ -265,6 +289,9 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
         scheduler = None
 
     best_val_loss, wait = float("inf"), 0
+    # Auto LR tracking (separate from early stopping)
+    best_auto_metric = None
+    auto_wait = 0
 
     import time
     optimizer_steps = 0
@@ -275,44 +302,72 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
         opt.zero_grad(set_to_none=True)
         # ---- Batch loop ----
         for batch_idx, batch in enumerate(train_loader):
-            Xb, Bb, Lb = (batch[0].to(device), batch[1].to(device), batch[2].to(device) if len(batch) > 2 else None)
-            
-            # Use autocast only when CUDA available; otherwise disable to silence warnings
-            with torch.amp.autocast(device_type='cuda', enabled=use_amp and torch.cuda.is_available()):
-                recon_mu, recon_theta, mu, log_var, b_logits, l_logits, _ = model(Xb, adv_lambda=lam)
-                loss_r = nb_loss(recon_mu, recon_theta, Xb)
-                loss_kl = kl_divergence_loss(mu, log_var)
-                loss_a = ce(b_logits, Bb)
-                total_loss = loss_r + (kl_weight * loss_kl) + (adv_weight * loss_a)
-                if l_logits is not None:
-                    total_loss += sup_weight * ce(l_logits, Lb)
-                loss = total_loss
-            # Gradient accumulation
-            if grad_accum_steps > 1:
-                loss = loss / grad_accum_steps
-            scaler.scale(loss).backward()
-            do_step = ((batch_idx + 1) % grad_accum_steps == 0) or (batch_idx + 1 == len(train_loader))
-            if do_step:
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad(set_to_none=True)
-                optimizer_steps += 1
-                if scheduler and scheduler_type == 'cosine_warmup':
-                    scheduler.step()
-                # Per-step logging
-                if log_lr_steps or (wandb_run and getattr(wandb_run, 'config', None) and getattr(wandb_run.config, 'log_lr_steps', False)):
-                    lr_now = opt.param_groups[0]['lr']
-                    try:
-                        if wandb_run:
-                            wandb_run.log({"lr_step": lr_now, "train_loss_step": float(total_loss.detach())}, step=optimizer_steps)
-                        else:
-                            print(f"Step {optimizer_steps:06d} LR {lr_now:.2e} Loss {float(total_loss.detach()):.4f}")
-                    except Exception:
-                        pass
-                elif not wandb_run:
-                    # Lightweight optional console logging every 200 optimizer steps when not using W&B
-                    if optimizer_steps % 200 == 0:
+            if not use_cuda_graphs:
+                Xb, Bb, Lb = (batch[0].to(device), batch[1].to(device), batch[2].to(device) if len(batch) > 2 else None)
+                with torch.amp.autocast(device_type='cuda', dtype=precision_dtype, enabled=use_amp and torch.cuda.is_available()):
+                    recon_mu, recon_theta, mu, log_var, b_logits, l_logits, _ = model(Xb, adv_lambda=lam)
+                    loss_r = nb_loss(recon_mu, recon_theta, Xb)
+                    loss_kl = kl_divergence_loss(mu, log_var)
+                    loss_a = ce(b_logits, Bb)
+                    total_loss = loss_r + (kl_weight * loss_kl) + (adv_weight * loss_a)
+                    if l_logits is not None:
+                        total_loss += sup_weight * ce(l_logits, Lb)
+                    loss = total_loss
+                if grad_accum_steps > 1:
+                    loss = loss / grad_accum_steps
+                scaler.scale(loss).backward()
+                do_step = ((batch_idx + 1) % grad_accum_steps == 0) or (batch_idx + 1 == len(train_loader))
+                if do_step:
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+                    if scheduler and scheduler_type == 'cosine_warmup':
+                        scheduler.step()
+                    if log_lr_steps or (wandb_run and getattr(wandb_run, 'config', None) and getattr(wandb_run.config, 'log_lr_steps', False)):
+                        lr_now = opt.param_groups[0]['lr']
+                        try:
+                            if wandb_run:
+                                wandb_run.log({"lr_step": lr_now, "train_loss_step": float(total_loss.detach())}, step=optimizer_steps)
+                            else:
+                                print(f"Step {optimizer_steps:06d} LR {lr_now:.2e} Loss {float(total_loss.detach()):.4f}")
+                        except Exception:
+                            pass
+                    elif not wandb_run and optimizer_steps % 200 == 0:
                         print(f"Step {optimizer_steps:06d} Loss {float(total_loss.detach()):.4f}")
+            else:
+                # CUDA Graphs path
+                if not capture_done:
+                    Xb, Bb, Lb = (batch[0].to(device), batch[1].to(device), batch[2].to(device) if len(batch) > 2 else None)
+                    # Warmup (optimizer state init)
+                    opt.zero_grad(set_to_none=True)
+                    with torch.amp.autocast(device_type='cuda', dtype=precision_dtype, enabled=use_amp and torch.cuda.is_available()):
+                        recon_mu, recon_theta, mu, log_var, b_logits, l_logits, _ = model(Xb, adv_lambda=lam)
+                        warm_loss = nb_loss(recon_mu, recon_theta, Xb) + kl_weight * kl_divergence_loss(mu, log_var) + adv_weight * ce(b_logits, Bb)
+                        if l_logits is not None:
+                            warm_loss = warm_loss + sup_weight * ce(l_logits, Lb)
+                    warm_loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
+                    torch.cuda.synchronize()
+                    static_X = Xb.clone(); static_B = Bb.clone(); static_L = Lb.clone() if Lb is not None else None
+                    graph = torch.cuda.CUDAGraph()
+                    # Capture
+                    with torch.cuda.graph(graph):
+                        recon_mu_g, recon_theta_g, mu_g, log_var_g, b_logits_g, l_logits_g, _ = model(static_X, adv_lambda=lam)
+                        g_loss = nb_loss(recon_mu_g, recon_theta_g, static_X) + kl_weight * kl_divergence_loss(mu_g, log_var_g) + adv_weight * ce(b_logits_g, static_B)
+                        if static_L is not None and l_logits_g is not None:
+                            g_loss = g_loss + sup_weight * ce(l_logits_g, static_L)
+                        g_loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
+                    capture_done = True
+                    optimizer_steps += 1
+                else:
+                    Xb, Bb, Lb = (batch[0].to(device), batch[1].to(device), batch[2].to(device) if len(batch) > 2 else None)
+                    if Xb.shape == static_X.shape:
+                        static_X.copy_(Xb); static_B.copy_(Bb)
+                        if static_L is not None and Lb is not None and static_L.shape == Lb.shape:
+                            static_L.copy_(Lb)
+                        graph.replay(); optimizer_steps += 1
+                    else:
+                        print("[WARN] Batch shape changed; skipping CUDA Graph replay this batch")
 
         # Validation
         model.eval()
@@ -354,17 +409,76 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                     cond_sil = safe_silhouette(all_z_np, all_l_np)
                 else:
                     cond_sil = 0.0
-                cond_minus_batch = cond_sil - batch_sil
+                cond_minus_batch_sil = cond_sil - batch_sil
             else:
                 batch_sil = 0.0
                 cond_sil = 0.0
-                cond_minus_batch = 0.0
+                cond_minus_batch_sil = 0.0
         except Exception:
-            batch_sil = cond_sil = cond_minus_batch = 0.0
+            batch_sil = cond_sil = cond_minus_batch_sil = 0.0
+
+        # Disentanglement / verification metrics
+        chance_batch = 1.0 / max(1, len(batch_classes) if batch_classes else 1)
+        chance_label = 1.0 / max(1, len(label_classes) if (label_classes and not np.isnan(l_acc)) else 1)
+        batch_acc_norm = (b_acc - chance_batch) / max(1e-8, 1 - chance_batch)  # 0 = chance, 1 = perfect
+        if not np.isnan(l_acc):
+            cond_acc_norm = (l_acc - chance_label) / max(1e-8, 1 - chance_label)
+        else:
+            cond_acc_norm = np.nan
+        # We want high condition clustering (cond_sil) and low batch clustering (batch_sil) and low batch accuracy
+        disentangle_score = cond_sil - batch_sil  # higher better
+        # Reward signal combining normalized accuracies (condition up, batch down)
+        if not np.isnan(cond_acc_norm):
+            reward_score = cond_acc_norm - batch_acc_norm
+        else:
+            reward_score = np.nan
 
         t1 = time.time()
         current_lr = opt.param_groups[0]['lr']
         print(f"E {epoch+1:03d} | VLoss {val_loss:.4f} | BAcc {b_acc:.3f}" + (f" | LAcc {l_acc:.3f}" if not np.isnan(l_acc) else "") + f" | LR {current_lr:.2e} | Time {t1-t0:.2f}s")
+
+        # Decide auto metric value (higher is better for reward/disentangle, lower is better for loss)
+        if auto_lr:
+            if auto_lr_metric == 'reward':
+                # Prefer reward_score, else fall back to disentangle_score, else negative val_loss
+                if not np.isnan(reward_score):
+                    current_metric = reward_score
+                    higher_is_better = True
+                elif not np.isnan(disentangle_score):
+                    current_metric = disentangle_score
+                    higher_is_better = True
+                else:
+                    current_metric = -val_loss
+                    higher_is_better = True
+            elif auto_lr_metric == 'disentangle':
+                current_metric = disentangle_score
+                higher_is_better = True
+            else:  # val_loss
+                current_metric = val_loss
+                higher_is_better = False
+            if best_auto_metric is None:
+                best_auto_metric = current_metric
+                auto_wait = 0
+            else:
+                improved = (current_metric > best_auto_metric + 1e-8) if higher_is_better else (current_metric < best_auto_metric - 1e-8)
+                if improved:
+                    best_auto_metric = current_metric
+                    auto_wait = 0
+                else:
+                    auto_wait += 1
+                    if auto_wait >= auto_lr_patience:
+                        old_lr = opt.param_groups[0]['lr']
+                        new_lr = max(auto_min_lr, old_lr * auto_lr_factor)
+                        if new_lr < old_lr - 1e-12:
+                            for g in opt.param_groups:
+                                g['lr'] = new_lr
+                            print(f"[AUTO-LR] Reducing LR from {old_lr:.3e} to {new_lr:.3e} (metric plateau)")
+                            if wandb_run:
+                                try:
+                                    wandb_run.log({"auto_lr/old_lr": old_lr, "auto_lr/new_lr": new_lr, "auto_lr/metric": current_metric, "epoch": epoch+1})
+                                except Exception:
+                                    pass
+                        auto_wait = 0
 
         if wandb_run:
             log_dict = {"epoch": epoch, "val_loss": val_loss, "val_batch_acc": b_acc,
@@ -372,6 +486,9 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                         "val_adv_loss": val_a/len(val_loader), "grl_lambda": lam}
             if not np.isnan(l_acc):
                 log_dict["val_label_acc"] = l_acc
+                # Keep backwards-compatible key but clarify meaning via additional metrics
+                log_dict["label_minus_batch_acc"] = l_acc - b_acc
+                # Backward compatibility for existing sweeps expecting 'cond_minus_batch'
                 log_dict["cond_minus_batch"] = l_acc - b_acc
             if log_latent_every > 0 and ((epoch + 1) % log_latent_every == 0):
                 try:
@@ -381,25 +498,65 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                     for i, label in enumerate(batch_classes):
                         mask = np.array(all_b_true) == i
                         ax.scatter(pca_z[mask, 0], pca_z[mask, 1], label=label, alpha=0.75, s=12)
+                    # Overlay condition / label markers (shapes) if labels provided
+                    if all_l_true:
+                        labels_arr = np.array(all_l_true)
+                        # Ensure length matches
+                        if labels_arr.shape[0] == pca_z.shape[0]:
+                            uniq_labs = np.unique(labels_arr)
+                            # Determine marker mapping (special-case tumor/normal)
+                            markers_cycle = ["o","s","^","D","v","P","X","*","<",">"]
+                            marker_map = {}
+                            if label_classes:
+                                lower = [c.lower() for c in label_classes]
+                                if 'tumor' in lower and 'normal' in lower:
+                                    for idx, cls in enumerate(label_classes):
+                                        if cls.lower() == 'tumor': marker_map[idx] = '^'
+                                        elif cls.lower() == 'normal': marker_map[idx] = 'o'
+                            for j, lab in enumerate(uniq_labs):
+                                m = marker_map.get(lab, markers_cycle[j % len(markers_cycle)])
+                                lab_name = label_classes[lab] if label_classes and lab < len(label_classes) else str(lab)
+                                mask_l = labels_arr == lab
+                                ax.scatter(pca_z[mask_l, 0], pca_z[mask_l, 1], facecolors='none', edgecolors='k', marker=m,
+                                           s=55, linewidths=0.9, label=f"{lab_name} (label)")
                     ax.legend(fontsize='x-small'); ax.set_title(f'Latent PCA E{epoch+1}'); ax.set_xticks([]); ax.set_yticks([])
                     log_dict["latent_space_pca"] = wandb.Image(fig)
                     plt.close(fig)
                 except Exception as e:
                     print(f"[WARN] Latent viz failed: {e}")
-            wandb_run.log(log_dict)
-            wandb_run.log({
+            # Add disentanglement verification metrics
+            log_dict.update({
                 "val/cond_sil": cond_sil,
                 "val/batch_sil": batch_sil,
-                "val/cond_minus_batch": cond_minus_batch,
-                "epoch": epoch + 1,
-                "val/loss": val_loss,
-                # keep existing logged losses (recon, kl, adv, sup) if you track them
+                "val/cond_minus_batch_sil": cond_minus_batch_sil,
+                "val/batch_acc_norm": batch_acc_norm,
+                **({"val/cond_acc_norm": cond_acc_norm} if not np.isnan(cond_acc_norm) else {}),
+                "val/disentangle_score": disentangle_score,
+                **({"val/reward_score": reward_score} if not np.isnan(reward_score) else {}),
+                "val/chance_batch_acc": chance_batch,
+                **({"val/chance_label_acc": chance_label} if not np.isnan(l_acc) else {}),
+                **({"auto_lr/current_metric": current_metric} if auto_lr else {}),
+                **({"auto_lr/best_metric": best_auto_metric} if auto_lr and best_auto_metric is not None else {}),
             })
+            wandb_run.log(log_dict)
 
         if val_loss < best_val_loss:
             best_val_loss, wait = val_loss, 0
             if save_best_path:
-                torch.save(model.state_dict(), save_best_path)
+                try:
+                    parent_dir = Path(save_best_path).parent
+                    if parent_dir and not parent_dir.exists():
+                        parent_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(model.state_dict(), str(save_best_path))
+                except Exception as e:
+                    import time as _time
+                    fallback = parent_dir / f"{Path(save_best_path).stem}_fallback_{int(_time.time())}.pt" if 'parent_dir' in locals() else Path(f"fallback_model_{int(_time.time())}.pt")
+                    print(f"[WARN] Failed to save model to {save_best_path} ({e}); attempting fallback {fallback}")
+                    try:
+                        torch.save(model.state_dict(), str(fallback))
+                        print(f"[OK] Model saved to fallback path: {fallback}")
+                    except Exception as e2:
+                        print(f"[FATAL] Could not save model checkpoint: {e2}")
         else:
             wait += 1
             if wait >= patience:
@@ -589,70 +746,107 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
     except Exception as e:
         print(f"[VIZ] PCA panel failed ({out_path}): {e}")
 
-def main():
-    ap = argparse.ArgumentParser(description="Improved VAE Batch Corrector with W&B support.")
-    ap.add_argument("--counts", required=True, type=Path)
-    ap.add_argument("--metadata", required=True, type=Path)
-    ap.add_argument("--out_corrected", required=True, type=Path)
-    ap.add_argument("--sample_col", default="sample", type=str)
-    ap.add_argument("--batch_col", default="batch", type=str)
-    ap.add_argument("--label_col", default=None, type=str)
-    ap.add_argument("--genes_in_rows", action="store_true")
-    ap.add_argument("--hvg", default=5000, type=int)
-    ap.add_argument("--latent_dim", default=32, type=int)
-    ap.add_argument("--enc_hidden", default="1024,256", type=str)
-    ap.add_argument("--dec_hidden", default="256,1024", type=str)
-    ap.add_argument("--adv_hidden", default="128", type=str)
-    ap.add_argument("--sup_hidden", default="64", type=str)
-    ap.add_argument("--attention_heads", default=4, type=int)
-    ap.add_argument("--epochs", default=200, type=int)
-    ap.add_argument("--lr", default=1e-3, type=float)
-    ap.add_argument("--batch_size", default=256, type=int)
-    ap.add_argument("--adv_weight", default=1.0, type=float)
-    ap.add_argument("--sup_weight", default=1.0, type=float)
-    ap.add_argument("--kl_weight", default=0.001, type=float)
-    ap.add_argument("--weight_decay", default=0.0, type=float)
-    ap.add_argument("--scheduler", default="cosine_warmup", choices=["none", "plateau", "cosine", "cosine_warmup"], help="LR scheduler (cosine_warmup adds linear warmup + cosine decay)")
-    ap.add_argument("--warmup_ratio", default=0.1, type=float, help="Fraction of total optimizer steps used for linear warmup (cosine_warmup only)")
-    ap.add_argument("--amp", action="store_true", help="Enable Mixed Precision Training")
-    ap.add_argument("--dropout", default=0.1, type=float)
-    ap.add_argument("--patience", default=20, type=int)
-    ap.add_argument("--seed", default=42, type=int)
-    ap.add_argument("--out_latent", type=Path, default=None)
-    ap.add_argument("--out_shap", type=Path, default=None)
-    ap.add_argument("--save_model_path", type=Path, default="best_model.pt")
-    ap.add_argument("--num_workers", default=6, type=int, help="DataLoader workers (increase to improve pipeline overlap)")
-    ap.add_argument("--prefetch_factor", default=12, type=int, help="DataLoader prefetch factor (default 2; increase for large GPU)")
-    ap.add_argument("--pin_memory", action="store_true", help="Pin memory for faster host->GPU transfer")
-    ap.add_argument("--log_latent_every", default=0, type=int, help="Log latent PCA to W&B every N epochs (0=disable)")
-    ap.add_argument("--compile", action="store_true", help="Use torch.compile for model (PyTorch 2.x)")
-    ap.add_argument("--channels_last", action="store_true", help="Use channels_last memory format for potential speed")
-    ap.add_argument("--grad_accum", default=1, type=int, help="Gradient accumulation steps to increase effective batch size")
-    ap.add_argument("--log_lr_steps", action="store_true", help="Print / log LR and loss each optimizer step")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Improved VAE Batch Corrector with W&B support.")
+    parser.add_argument("--counts", required=True, type=Path)
+    parser.add_argument("--metadata", required=True, type=Path)
+    parser.add_argument("--out_corrected", required=True, type=Path)
+    parser.add_argument("--sample_col", default="sample", type=str)
+    parser.add_argument("--batch_col", default="batch", type=str)
+    parser.add_argument("--label_col", default=None, type=str)
+    parser.add_argument("--genes_in_rows", action="store_true")
+    parser.add_argument("--hvg", default=5000, type=int)
+    parser.add_argument("--latent_dim", default=32, type=int)
+    parser.add_argument("--enc_hidden", default="1024,256", type=str)
+    parser.add_argument("--dec_hidden", default="256,1024", type=str)
+    parser.add_argument("--adv_hidden", default="128", type=str)
+    parser.add_argument("--sup_hidden", default="64", type=str)
+    parser.add_argument("--attention_heads", default=4, type=int)
+    parser.add_argument("--epochs", default=200, type=int)
+    parser.add_argument("--lr", default=1e-3, type=float)
+    parser.add_argument("--batch_size", default=256, type=int)
+    parser.add_argument("--adv_weight", default=1.0, type=float)
+    parser.add_argument("--sup_weight", default=1.0, type=float)
+    parser.add_argument("--kl_weight", default=0.001, type=float)
+    parser.add_argument("--weight_decay", default=0.0, type=float)
+    parser.add_argument("--scheduler", default="cosine_warmup", choices=["none", "plateau", "cosine", "cosine_warmup"], help="LR scheduler (cosine_warmup adds linear warmup + cosine decay)")
+    parser.add_argument("--warmup_ratio", default=0.1, type=float, help="Fraction of total optimizer steps used for linear warmup (cosine_warmup only)")
+    parser.add_argument("--amp", action="store_true", help="Enable autocast mixed precision")
+    parser.add_argument("--precision", default="auto",
+                        choices=["auto", "fp16", "bf16", "fp32"],
+                        help="Numerical precision mode")
+    parser.add_argument("--dropout", default=0.1, type=float)
+    parser.add_argument("--patience", default=20, type=int)
+    parser.add_argument("--seed", default=42, type=int)
+    parser.add_argument("--out_latent", type=Path, default=None)
+    parser.add_argument("--out_shap", type=Path, default=None)
+    parser.add_argument("--save_model_path", type=Path, default="best_model.pt")
+    parser.add_argument("--num_workers", default=4, type=int, help="DataLoader workers (increase to improve pipeline overlap)")
+    parser.add_argument("--prefetch_factor", default=8, type=int, help="DataLoader prefetch factor (default 2; increase for large GPU)")
+    parser.add_argument("--pin_memory", action="store_true", help="Pin memory for faster host->GPU transfer")
+    parser.add_argument("--log_latent_every", default=0, type=int, help="Log latent PCA to W&B every N epochs (0=disable)")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for model (PyTorch 2.x)")
+    parser.add_argument("--channels_last", action="store_true", help="Use channels_last memory format for potential speed")
+    parser.add_argument("--grad_accum", default=1, type=int, help="Gradient accumulation steps to increase effective batch size")
+    parser.add_argument("--log_lr_steps", action="store_true", help="Print / log LR and loss each optimizer step")
+    parser.add_argument("--cudnn_benchmark", action="store_true", help="Enable cudnn.benchmark for conv autotuning (may help larger models)")
+    parser.add_argument("--fused_optim", action="store_true", help="Use fused AdamW optimizer if available (PyTorch 2.0+)")
+    parser.add_argument("--cuda_graphs", action="store_true", help="Capture training step with CUDA Graphs (static shapes; disables grad accumulation)")
+    parser.add_argument("--run_id", type=str, default=None, help="Optional external run ID for reproducibility")
+    # Auto LR adjustment
+    parser.add_argument("--auto_lr", action="store_true", help="Enable simple adaptive LR reduction on metric plateau")
+    parser.add_argument("--auto_lr_metric", default="reward", choices=["reward","disentangle","val_loss"], help="Metric to monitor for auto LR; reward=reward_score, disentangle=cond_sil-batch_sil")
+    parser.add_argument("--auto_lr_factor", type=float, default=0.5, help="Factor to multiply LR by when reducing")
+    parser.add_argument("--auto_lr_patience", type=int, default=5, help="Epochs without improvement before LR reduction")
+    parser.add_argument("--auto_min_lr", type=float, default=1e-6, help="Lower bound on LR for auto reduction")
     # W&B arguments
-    ap.add_argument("--use_wandb", action="store_true", help="Enable W&B logging")
-    ap.add_argument("--wandb_project", default="harmonize-nn-vae", type=str, help="W&B project name")
-    ap.add_argument("--wandb_entity", default=None, type=str, help="W&B entity (username or team)")
+    parser.add_argument("--use_wandb", action="store_true", help="Enable W&B logging")
+    parser.add_argument("--wandb_project", default="harmonize-nn-vae", type=str, help="W&B project name")
+    parser.add_argument("--wandb_entity", default=None, type=str, help="W&B entity (username or team)")
     # Visualisation options
-    ap.add_argument("--generate_viz", action="store_true", help="Generate PCA (before/after) and batch boxplots")
-    ap.add_argument("--viz_hvg_top", default=2000, type=int, help="Top-N genes for PCA visualisations (0=all)")
-    ap.add_argument("--viz_pca_before", default="pca_before.png", type=str, help="Output path for PCA before correction")
-    ap.add_argument("--viz_pca_after", default="pca_after.png", type=str, help="Output path for PCA after correction")
-    ap.add_argument("--viz_boxplot", default="logCPM_boxplots.png", type=str, help="Output path for logCPM boxplots")
-    ap.add_argument("--viz_pca_panel", default="pca_panel.png", type=str, help="Output path for combined before/after PCA panel")
-    ap.add_argument("--debug_device", action="store_true", help="Print detailed device / CUDA diagnostic info")
-    ap.add_argument("--require_cuda", action="store_true", help="Abort if CUDA not available (helps catch env mismatches in sweeps)")
-    ap.add_argument("--fast_start", action="store_true", help="Skip visualisations & latent logging for faster sweeps")
-    ap.add_argument("--cache_dir", type=Path, default=None, help="Optional directory to cache logCPM + HVG selection")
-    args = ap.parse_args()
-    set_seed(args.seed)
+    parser.add_argument("--generate_viz", action="store_true", help="Generate PCA (before/after) and batch boxplots")
+    parser.add_argument("--viz_hvg_top", default=2000, type=int, help="Top-N genes for PCA visualisations (0=all)")
+    parser.add_argument("--viz_pca_before", default="pca_before.png", type=str, help="Output path for PCA before correction")
+    parser.add_argument("--viz_pca_after", default="pca_after.png", type=str, help="Output path for PCA after correction")
+    parser.add_argument("--viz_boxplot", default="logCPM_boxplots.png", type=str, help="Output path for logCPM boxplots")
+    parser.add_argument("--viz_pca_panel", default="pca_panel.png", type=str, help="Output path for combined before/after PCA panel")
+    parser.add_argument("--debug_device", action="store_true", help="Print detailed device / CUDA diagnostic info")
+    parser.add_argument("--require_cuda", action="store_true", help="Abort if CUDA not available (helps catch env mismatches in sweeps)")
+    parser.add_argument("--fast_start", action="store_true", help="Skip visualisations & latent logging for faster sweeps")
+    parser.add_argument("--cache_dir", type=Path, default=None, help="Optional directory to cache logCPM + HVG selection")
+    return parser.parse_args()
 
+def select_precision(args):
+    if args.precision == "fp32":
+        return torch.float32
+    if args.precision == "fp16":
+        return torch.float16
+    if args.precision == "bf16":
+        return torch.bfloat16
+    # auto
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        # Ampere (8.x) or newer => prefer bf16
+        if major >= 8 and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        else:
+            return torch.float16
+    return torch.float32
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    precision_dtype = select_precision(args)
+    use_amp = args.amp and precision_dtype in (torch.float16, torch.bfloat16)
+
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
     # Global perf knobs
     try:
         torch.set_float32_matmul_precision('high')
     except Exception:
         pass
-    torch.backends.cudnn.benchmark = True
 
     import time, hashlib, json
     t0 = time.time()
@@ -784,9 +978,13 @@ def main():
     fit = train_model(model, dl_train, dl_val, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                       adv_weight=args.adv_weight, sup_weight=args.sup_weight, kl_weight=args.kl_weight,
                       use_amp=args.amp, scheduler_type=args.scheduler, patience=args.patience,
-                      save_best_path=args.save_model_path, wandb_run=wandb_run, batch_classes=batch_cats.cat.categories.tolist(), device=device,
+                      save_best_path=args.save_model_path, wandb_run=wandb_run, batch_classes=batch_cats.cat.categories.tolist(), label_classes=label_classes,
+                      device=device,
                       log_latent_every=args.log_latent_every, grad_accum_steps=args.grad_accum, warmup_ratio=args.warmup_ratio,
-                      log_lr_steps=args.log_lr_steps)
+                      log_lr_steps=args.log_lr_steps, use_fused_optim=args.fused_optim, use_cuda_graphs=args.cuda_graphs,
+                      precision_dtype=precision_dtype,
+                      auto_lr=args.auto_lr, auto_lr_metric=args.auto_lr_metric, auto_lr_factor=args.auto_lr_factor,
+                      auto_lr_patience=args.auto_lr_patience, auto_min_lr=args.auto_min_lr)
     model = fit["model"]
     t_train_end = time.time()
     print(f"[TIMING] load={t_load1-t_load0:.2f}s preprocess={t_proc-t_load1:.2f}s train_total={t_train_end-t_proc:.2f}s")

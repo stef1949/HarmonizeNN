@@ -1,86 +1,161 @@
+###############################################################
+# Weights & Biases Sweep Configuration
+# This sweep tunes a conditional adversarial VAE for batch correction
+# of (synthetic) bulk RNA-seq counts while preserving condition signal.
+# Search strategy: Bayesian optimization over mixed discrete/continuous space.
+###############################################################
+
+# Entry point script that parses these CLI args and launches training
 program: VAEModel/vaemodeltest.py
+
+# Sweep search algorithm: bayes / random / grid (here Bayesian opt)
 method: bayes
+
+# Primary objective to maximise: custom metric (condition accuracy - batch leakage)
 metric:
+  # Reported metric name logged by the training script
   name: cond_minus_batch
+  # We want to maximise separation of condition while minimising batch
   goal: maximize
+
+# Command template executed per trial. ${env} injects sweep env vars,
+# ${program} resolves to 'program:' above, ${args} expanded hyperparams.
 command:
   - ${env}
+  # Absolute path to venv python for reproducibility (consider making relative)
   - c:/Users/stef1/OneDrive/Documents/vscode/NNBatchCorrection/.venv/Scripts/python.exe
   - ${program}
+  # Enable wandb logging inside script
   - --use_wandb
+  # Mixed precision (torch.cuda.amp) for speed / memory
   - --amp
+  # Pin DataLoader memory to speed host->device transfer
   - --pin_memory
-  - --fast_start
-  # Uncomment next line to enforce GPU usage and abort if missing
-  # - --require_cuda
+  # - --fast_start            # Optional flag for quicker dev iterations
+  # (channels_last not beneficial for linear MLPs; omit to reduce clutter)
+  - --cudnn_benchmark 
+  - --fused_optim
+  - --auto_lr
+  - --auto_lr_metric
+  - reward
+  # precision supplied via parameter below (removed fixed --precision auto)
+  #- --precision=${precision}
+  # cuda_graphs removed as sweep parameter because argparse store_true cannot take a value;
+  # if you want to benchmark with CUDA Graphs always on, uncomment next line
+  # - --cuda_graphs
+  # - --require_cuda          # Uncomment to fail fast if CUDA not available
   - ${args}
 parameters:
+  # Path to raw counts matrix (samples x genes or vice versa as expected by script)
   counts:
     value: VAEModel/synthetic_counts.csv
+  # Sample-level metadata (contains batch & condition columns)
   metadata:
     value: VAEModel/synthetic_metadata.csv
+  # Column in metadata that uniquely identifies samples / libraries
   sample_col:
     value: sample
+  # Batch column used for adversarial removal
   batch_col:
     value: batch
+  # Biological condition / label column to preserve (used for supervised head)
   label_col:
     value: condition
+  # Output path for batch-corrected expression (e.g., logCPM or transformed)
   out_corrected:
     value: VAEModel/sweep_corrected.csv
+  # Output path for latent embedding CSV (rows = samples, cols = latent dims)
   out_latent:
     value: VAEModel/sweep_latent.csv
+  # Output PCA panel figure summarising before/after correction
   viz_pca_panel:
     value: VAEModel/sweep_pca_panel.png
+  # Max training epochs (early stopping may cut short)
   epochs:
     value: 120
+  # Early stopping patience in epochs on validation metric
   patience:
     value: 25
+  # Number of highly variable genes to select (discrete choices)
   hvg:
     values: [3000, 5000]
+  # Dimensionality of latent space (capacity vs over-regularization tradeoff)
   latent_dim:
-    values: [16, 24, 32]
+    values: [8, 12, 16, 24, 32]
+  # Encoder hidden layer sizes (comma-separated parsed inside script)
   enc_hidden:
     values: ["1024,256", "1024,512,256"]
+  # Decoder hidden layer sizes (mirrors encoder depth variants)
   dec_hidden:
     values: ["256,1024", "256,512,1024"]
+  # Adversarial discriminator hidden sizes (for batch prediction)
   adv_hidden:
     values: ["128", "256"]
+  # Supervised condition classifier hidden sizes
   sup_hidden:
     values: ["64", "128"]
+  # Weight of adversarial loss (higher => stronger batch removal)
   adv_weight:
     min: 1.0
     max: 5.0
+  # Weight of supervised condition classification loss
   sup_weight:
     min: 0.5
     max: 2.0
+  # KL divergence annealing weight (log-uniform: explores orders of magnitude)
   kl_weight:
     distribution: log_uniform_values
-    min: 0.0005
+    min: 0.0001
     max: 0.01
+  # Dropout probability applied to hidden layers
   dropout:
-    values: [0.1, 0.2, 0.3]
+    values: [0.1, 0.2, 0.3, 0.4, 0.5]
+  # Optimizer learning rate (log-uniform to capture scale sensitivity)
   lr:
     distribution: log_uniform_values
-    min: 0.00005
+    min: 0.000001
     max: 0.002
+  # Mini-batch size (affects gradient noise & memory)
   batch_size:
-    values: [64, 96, 128]
+    values: [64, 96, 128, 256, 512]
+  # DataLoader worker processes (tune per CPU resources)
   num_workers:
     value: 6
+  # DataLoader prefetching
+  prefetch_factor:
+    value: 4                        # Add if script maps to DataLoader(prefetch_factor=)
+  # Mixed precision training
+  precision:
+    values: [auto] #  ["auto", "bf16", "fp16"]
+  # LR scheduler strategy (cosine with warmup ramp)
   scheduler:
     value: cosine_warmup
+  # Fraction of total steps used for linear warmup before cosine decay
   warmup_ratio:
     value: 0.05
+  # Gradient accumulation steps (effective batch = batch_size * grad_accum)
   grad_accum:
-    value: 4
+    value: 1   # Set 1 for maximal throughput; adjust if batch doesn't fit
+  auto_lr_factor:
+    values: [0.5, 0.3]
+  auto_lr_patience:
+    values: [4, 6]
+  auto_min_lr:
+    value: 1e-6
+  # Log latent space / projections every N epochs
   log_latent_every:
     value: 5
+  # Top HVGs to visualise in diagnostic plots
   viz_hvg_top:
     value: 2000
+  # Random seeds to evaluate robustness / variability
   seed:
     values: [42, 1337]
+  # Directory for caching preprocessed data (HVG selection, logCPM, etc.)
   cache_dir:
     value: VAEModel/cache
 early_terminate:
+  # Use HyperBand style early termination (bandit) to stop underperforming runs
   type: hyperband
+  # Minimum iterations (epochs) before a run can be considered for pruning
   min_iter: 20

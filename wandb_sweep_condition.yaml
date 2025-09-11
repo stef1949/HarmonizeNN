@@ -3,6 +3,16 @@ method: bayes
 metric:
   name: cond_minus_batch
   goal: maximize
+command:
+  - ${env}
+  - c:/Users/stef1/OneDrive/Documents/vscode/NNBatchCorrection/.venv/Scripts/python.exe
+  - ${program}
+  - --use_wandb
+  - --amp
+  - --pin_memory
+  - --fused_optim
+  - --cudnn_benchmark
+  - ${args}
 parameters:
   counts:
     value: bulk_counts.csv
@@ -72,6 +82,16 @@ parameters:
     value: 2000
   seed:
     values: [42, 1337]
+  auto_lr:
+    value: true
+  auto_lr_metric:
+    value: reward
+  auto_lr_factor:
+    values: [0.5, 0.3]
+  auto_lr_patience:
+    values: [4, 6]
+  auto_min_lr:
+    value: 1e-6
 early_terminate:
   type: hyperband
   min_iter: 20
