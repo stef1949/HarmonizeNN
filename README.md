@@ -1,5 +1,9 @@
 # Neural Network Batch Correction (Adversarial Autoencoder)
-
+<div align="center">
+  
+  [![Tests](https://github.com/stef1949/SimBu/actions/workflows/run-tests.yaml/badge.svg?branch=main)](https://github.com/stef1949/SimBu/actions/workflows/unit-tests.yml)
+  [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+</div>
 <p align=center>
 <img src="logCPM_boxplots.png" alt="LogCPM Boxplots" height="300" align=center />
 <img src="VAEModel/pca_panel.png" alt="Before & After PCA Plots" height="300" align=center />
