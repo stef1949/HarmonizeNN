@@ -54,6 +54,7 @@ command:
   - --early_stop_delta
   - 0.002
   - --use_residual
+  - --generate_viz
   - --amp
   - --pin_memory
   # wrapper will generate visualisations after training
@@ -62,53 +63,53 @@ command:
 parameters:
   # Architecture: use uniform hidden sizes for residual MLPs
   hvg:
-    values: [2000, 3000, 5000, 8000]
+    values: [5000, 8000]
   latent_dim:
-    values: [24, 32, 48]
+    values: [24, 32]
   enc_hidden:
     # Residual requires uniform hidden sizes per MLP
-    values: ["128,128,128", "256,256", "256,256,256", "512,512"]
+    values: ["256,256", "256,256,256", "512,512"]
   dec_hidden:
-    values: ["128,128,128", "256,256", "256,256,256", "512,512"]
+    values: ["256,256", "256,256,256", "512,512"]
   adv_hidden:
-    values: ["128", "256,64"]
+    values: ["128"]
   sup_hidden:
     values: ["64", "128"]
   scheduler:
-    values: [cosine_warmup, cosine, plateau]
+    value: cosine_warmup
   warmup_ratio:
     # Only used when scheduler=cosine_warmup
     distribution: uniform
-    min: 0.05
-    max: 0.20
+    min: 0.09
+    max: 0.13
   grad_accum:
-    values: [1, 2, 4]
+    values: [1, 2]
   recon_loss:
     values: ["huber", "mse"]
   adv_lambda_schedule:
-    values: ["adaptive", "sigmoid"]
+    values: ["sigmoid"]
 
   # Continuous / probabilistic
   dropout:
     distribution: uniform
     min: 0.05
-    max: 0.30
+    max: 0.12
   lr:
     distribution: log_uniform_values
-    min: 0.00001
-    max: 0.0010
+    min: 0.0007
+    max: 0.0009
   weight_decay:
     values: [0.0, 1e-5, 1e-4]
 
   # Loss balancing
   adv_weight:
-    values: [0.6, 0.8, 1.0]
+    values: [0.6, 0.8]
   sup_weight:
-    values: [1.0, 1.5, 2.0]
+    values: [0.6, 0.8, 1.0]
 
   # Training dynamics
   batch_size:
-    values: [16, 32, 48]
+    values: [32, 48]
   adaptive_high_margin:
     distribution: uniform
     min: 0.18
@@ -136,10 +137,10 @@ parameters:
   cond_min:
     values: [0.10, 0.20, 0.30]
   overcorr_weight:
-    values: [0.5, 1.0]
+    values: [0.5, 0.7, 1.0]
   # Differentiable biology-preserving loss and adaptive adversary
   bio_weight:
-    values: [0.0, 0.1, 0.3, 0.5]
+    values: [0.0, 0.05, 0.1]
   bio_gamma:
     value: 0.5
   adaptive_cond_margin:

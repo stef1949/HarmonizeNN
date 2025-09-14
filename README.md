@@ -9,7 +9,7 @@
 
 <p align=center>
 <img src="logCPM_boxplots.png" alt="LogCPM Boxplots" height="200" align=center />
-<img src="VAEModel\sweep_pca_panel.png" alt="Before & After PCA Plots" height="200" align=center />
+<img src="assets\pca_panel.png" alt="Before & After PCA Plots" height="200" align=center />
 </p>
 
 An adversarial autoencoder for bulk RNA-seq batch effect correction. It learns a latent representation that preserves biological signal (optional supervised head) while discouraging batch-specific variation via a gradient reversal adversary. Outputs a batch-corrected expression matrix (logCPM scale) and optional latent embedding plus visual diagnostics.
@@ -34,6 +34,9 @@ An adversarial autoencoder for bulk RNA-seq batch effect correction. It learns a
 ---
 ## Repository Structure (selected)
 - `NN_batch_correct.py`  Main training + correction script
+- `models/`              Model components (adversarial AE) and factory
+  - `models/ae.py`      AEBatchCorrector, GradReverseLayer, ResidualBlock, make_mlp
+  - `models/factory.py` Helper to build AE or VAE+Attention models from CLI args
 - `visualise.py`         Standalone PCA / boxplot + architecture diagram utilities
 - `bulk_counts.csv`      Example counts matrix (shape: genes × samples or samples × genes)
 - `sample_meta.csv`      Example metadata (columns include sample,batch[,condition])
@@ -69,6 +72,11 @@ pip install -r requirements.txt
 
 Optional extras:
 - Set `WANDB_MODE=offline` to avoid network usage.
+
+---
+## Refactor Notes
+- Model code has been extracted from `NN_batch_correct.py` into `models/ae.py` and is re-exported via `models/__init__.py`. The CLI behavior is unchanged.
+- A lightweight factory (`models/factory.py`) centralizes model construction for AE vs. VAE+Attention to keep the training script focused on data and orchestration.
 
 ---
 ## Quick Start
