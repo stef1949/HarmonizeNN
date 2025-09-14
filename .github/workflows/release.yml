@@ -1,0 +1,25 @@
+# GitHub Action workflow is triggered when a new release is created.
+# It uploads the 'trained_model.pt' file from the repository to the release assets.
+
+name: Add Model to Release
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write # Required to upload release assets
+
+jobs:
+  upload_model:
+    name: Upload Model to Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Upload model to release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" trained_model.pt --clobber
