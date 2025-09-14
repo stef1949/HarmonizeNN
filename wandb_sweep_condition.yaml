@@ -1,18 +1,22 @@
 program: VAEModel/vaemodeltest.py
 method: bayes
 metric:
-  name: cond_minus_batch
+  name: objective_overcorr
   goal: maximize
+
+# Explicit command to properly handle boolean flags (store_true)
 command:
   - ${env}
-  - c:/Users/stef1/OneDrive/Documents/vscode/NNBatchCorrection/.venv/Scripts/python.exe
+  - python
   - ${program}
   - --use_wandb
   - --amp
   - --pin_memory
-  - --fused_optim
   - --cudnn_benchmark
+  - --fused_optim
+  - --generate_viz
   - ${args}
+
 parameters:
   counts:
     value: bulk_counts.csv
@@ -28,10 +32,28 @@ parameters:
     value: sweep_corrected.csv
   out_latent:
     value: sweep_latent.csv
-  generate_viz:
-    value: true
   viz_pca_panel:
     value: sweep_pca_panel.png
+  viz_pca_before:
+    value: sweep_pca_before.png
+  viz_pca_after:
+    value: sweep_pca_after.png
+  viz_boxplot:
+    value: sweep_boxplots.png
+  # Overcorrection penalty controls
+  cond_min:
+    values: [0.10, 0.20, 0.30]
+  overcorr_weight:
+    values: [0.5, 1.0]
+  # Differentiable biology-preserving loss and adaptive adversary
+  bio_weight:
+    values: [0.0, 0.1, 0.3, 0.5]
+  bio_gamma:
+    values: [0.5]
+  adaptive_cond_margin:
+    values: [0.02, 0.03]
+  adaptive_cond_scale:
+    values: [0.6, 0.7, 0.85]
   epochs:
     value: 120
   patience:
@@ -48,12 +70,18 @@ parameters:
     values: ["128", "256"]
   sup_hidden:
     values: ["64", "128"]
+  # Number of attention heads for the self-attention block
+  attention_heads:
+    values: [2, 4, 8]
   adv_weight:
     min: 1.0
     max: 5.0
   sup_weight:
     min: 0.5
     max: 2.0
+  # AdamW weight decay (includes 0 to disable)
+  weight_decay:
+    values: [0.0, 0.00001, 0.0001, 0.001]
   kl_weight:
     distribution: log_uniform_values
     min: 0.0005
@@ -66,12 +94,14 @@ parameters:
     max: 0.002
   batch_size:
     values: [64, 96, 128]
-  amp:
-    value: true
+  # Numerical precision mode swept alongside AMP
+  precision:
+    values: ["auto", "bf16", "fp16"]
+  # Effective batch growth for memory-constrained GPUs
+  grad_accum:
+    values: [1, 2]
   num_workers:
     value: 4
-  pin_memory:
-    value: true
   scheduler:
     value: cosine_warmup
   warmup_ratio:
@@ -82,16 +112,7 @@ parameters:
     value: 2000
   seed:
     values: [42, 1337]
-  auto_lr:
-    value: true
-  auto_lr_metric:
-    value: reward
-  auto_lr_factor:
-    values: [0.5, 0.3]
-  auto_lr_patience:
-    values: [4, 6]
-  auto_min_lr:
-    value: 1e-6
+
 early_terminate:
   type: hyperband
   min_iter: 20

@@ -48,7 +48,8 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score, accuracy_score
-from sklearn.model_selection import train_test_split
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
 
 # Optional SHAP import will be delayed (only if requested)
 
@@ -146,6 +147,149 @@ def make_weighted_sampler(b_codes: np.ndarray, l_codes: Optional[np.ndarray] = N
     weights = (weights / weights.mean()).astype(np.float64)
     return WeightedRandomSampler(weights.tolist(), num_samples=len(weights), replacement=True)
 
+def _train_val_split_indices_count(n: int, val_size: int, seed: int,
+                                   label_idx: Optional[np.ndarray], batch_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return train/val indices ensuring validation has both condition classes when possible.
+    Attempts stratification by (batch,label) pairs, then by label, then by batch;
+    falls back to random split, and finally forces at least one of each label into val.
+    """
+    rng = np.random.RandomState(seed)
+    val_size = max(1, min(int(val_size), n-1))
+    # If labels unavailable or only one class, disable label-based checks
+    if label_idx is not None and len(np.unique(label_idx)) < 2:
+        label_idx = None
+    # build pair code when both batch and label have >=2 classes
+    y_pair = None
+    if (label_idx is not None) and (batch_idx is not None) and (len(np.unique(batch_idx)) >= 2):
+        n_labels = int(len(np.unique(label_idx)))
+        y_pair = (batch_idx.astype(int) * n_labels) + label_idx.astype(int)
+    for y in (y_pair, label_idx, batch_idx, None):
+        try:
+            if y is not None:
+                splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=seed)
+                tr, va = next(splitter.split(np.zeros(n), y))
+            else:
+                idx = rng.permutation(n)
+                va, tr = idx[:val_size], idx[val_size:]
+            if label_idx is None:
+                return tr, va
+            # ensure both classes present in train and val
+            if len(np.unique(label_idx[va])) >= 2 and len(np.unique(label_idx[tr])) >= 2:
+                return tr, va
+        except Exception:
+            continue
+    # Last resort: force at least one of each label in val
+    if label_idx is not None:
+        classes = np.unique(label_idx)
+        chosen = []
+        for c in classes:
+            idx_c = np.where(label_idx == c)[0]
+            if len(idx_c) > 0:
+                chosen.append(rng.choice(idx_c))
+        remaining = [i for i in range(n) if i not in set(chosen)]
+        rng.shuffle(remaining)
+        need = max(0, val_size - len(chosen))
+        va = np.array(chosen + remaining[:need], dtype=int)
+        tr = np.array([i for i in range(n) if i not in set(va)], dtype=int)
+        return tr, va
+    # No labels -> random split
+    idx = rng.permutation(n)
+    va, tr = idx[:val_size], idx[val_size:]
+    return tr, va
+
+def bio_center_loss(z: torch.Tensor, labels: Optional[torch.Tensor], gamma: float = 0.5) -> torch.Tensor:
+    """Supervised, differentiable surrogate to preserve biological signal.
+    Minimizes within-class variance of latent features and maximizes between-class
+    center distances. Returns a scalar loss (mean over classes).
+    """
+    if labels is None or z is None or z.numel() == 0:
+        return z.new_tensor(0.0)
+    classes = torch.unique(labels)
+    if classes.numel() < 2:
+        return z.new_tensor(0.0)
+    within = z.new_tensor(0.0)
+    centers = []
+    for c in classes:
+        mask = (labels == c)
+        if mask.sum() == 0:
+            continue
+        zc = z[mask]
+        center = zc.mean(dim=0, keepdim=True)
+        centers.append(center)
+        diff = zc - center
+        within = within + (diff.pow(2).sum(dim=1).mean())
+    if len(centers) == 0:
+        return z.new_tensor(0.0)
+    within = within / max(1, len(centers))
+    centers_t = torch.cat(centers, dim=0)
+    if centers_t.size(0) > 1:
+        diff = centers_t.unsqueeze(1) - centers_t.unsqueeze(0)
+        d2 = diff.pow(2).sum(dim=2)
+        C = centers_t.size(0)
+        between = (d2.sum() - d2.diag().sum()) / max(1, C * (C - 1))
+    else:
+        between = z.new_tensor(0.0)
+    return within - gamma * between
+
+def _knn_stats(Z: np.ndarray, labels: np.ndarray, k: int = 15):
+    """kNN entropy/LISI/accuracy with robust label coding.
+    Handles string labels by mapping to integer codes first.
+    """
+    try:
+        n = Z.shape[0]
+        if n < 3 or labels is None:
+            return np.nan, np.nan, np.nan
+        labels = np.asarray(labels)
+        classes, inv = np.unique(labels, return_inverse=True)
+        C = int(len(classes))
+        if C <= 1:
+            return np.nan, np.nan, np.nan
+        k_eff = min(int(k), max(2, n - 1))
+        nn = NearestNeighbors(n_neighbors=k_eff + 1, algorithm="auto").fit(Z)
+        idx = nn.kneighbors(Z, return_distance=False)[:, 1:]
+        neigh_codes = inv[idx]
+        H = []
+        L = []
+        correct = 0
+        for i in range(n):
+            counts = np.bincount(neigh_codes[i], minlength=C).astype(float)
+            total = counts.sum()
+            if total <= 0:
+                H.append(np.nan); L.append(np.nan)
+                continue
+            p = counts / total
+            lisi = 1.0 / np.sum(p * p)
+            L.append(lisi)
+            mask = p > 0
+            h = -np.sum(p[mask] * np.log(p[mask] + 1e-12))
+            h_norm = h / np.log(C) if C > 1 else np.nan
+            H.append(h_norm)
+            maj = int(np.argmax(counts))
+            correct += (maj == int(inv[i]))
+        return float(np.nanmean(H)), float(np.nanmean(L)), float(correct / n)
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+def _eta2_by_group(Z: np.ndarray, groups: np.ndarray):
+    try:
+        n, d = Z.shape
+        if n < 3:
+            return np.nan
+        overall_mean = Z.mean(axis=0)
+        var_total = Z.var(axis=0, ddof=1) + 1e-12
+        ssb = np.zeros(d, dtype=float)
+        for g in np.unique(groups):
+            idx = (groups == g)
+            ng = idx.sum()
+            if ng == 0:
+                continue
+            diff = Z[idx].mean(axis=0) - overall_mean
+            ssb += ng * (diff ** 2)
+        eta2 = (ssb / (n * var_total)).mean()
+        return float(eta2)
+    except Exception:
+        return np.nan
+
 
 # ----------------------------
 # Gradient Reversal
@@ -178,25 +322,82 @@ class GradReverseLayer(nn.Module):
 # Model
 # ----------------------------
 
-def make_mlp(sizes, dropout=0.0, last_activation=None):
+class ResidualBlock(nn.Module):
+    """
+    Residual block with skip connection: x + FFN(x) + LayerNorm
+    """
+    def __init__(self, hidden_size: int, dropout: float = 0.0):
+        super().__init__()
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Dropout(dropout)
+        )
+        self.layer_norm = nn.LayerNorm(hidden_size)
+    
+    def forward(self, x):
+        return self.layer_norm(x + self.ffn(x))
+
+
+def make_mlp(sizes, dropout=0.0, last_activation=None, use_residual=False):
     """
     Hidden layers: Linear -> LayerNorm -> SiLU -> Dropout
     Output layer: optional activation per arg
+    
+    If use_residual=True, uses ResidualBlock layers instead.
+    Note: For residual connections to work, all hidden layer sizes must be the same.
     """
-    layers = []
-    for i in range(len(sizes) - 1):
-        in_f, out_f = sizes[i], sizes[i + 1]
-        layers.append(nn.Linear(in_f, out_f))
-        if i < len(sizes) - 2:
-            layers += [nn.LayerNorm(out_f), nn.SiLU(), nn.Dropout(dropout)]
-        else:
-            if last_activation == "relu":
-                layers += [nn.ReLU()]
-            elif last_activation == "tanh":
-                layers += [nn.Tanh()]
-            elif last_activation == "sigmoid":
-                layers += [nn.Sigmoid()]
-    return nn.Sequential(*layers)
+    if use_residual:
+        if len(sizes) < 3:
+            raise ValueError("Residual networks need at least input, hidden, and output layers")
+        
+        # Check that all hidden layers have the same size for residual connections
+        hidden_sizes = sizes[1:-1]
+        if len(set(hidden_sizes)) > 1:
+            raise ValueError(f"For residual connections, all hidden layer sizes must be the same. Got: {hidden_sizes}")
+        
+        hidden_size = hidden_sizes[0]
+        num_hidden_layers = len(hidden_sizes)
+        
+        layers = []
+        
+        # Input projection to hidden size
+        layers.append(nn.Linear(sizes[0], hidden_size))
+        layers.extend([nn.LayerNorm(hidden_size), nn.SiLU(), nn.Dropout(dropout)])
+        
+        # Residual blocks
+        for _ in range(num_hidden_layers):
+            layers.append(ResidualBlock(hidden_size, dropout))
+        
+        # Output layer
+        layers.append(nn.Linear(hidden_size, sizes[-1]))
+        if last_activation == "relu":
+            layers.append(nn.ReLU())
+        elif last_activation == "tanh":
+            layers.append(nn.Tanh())
+        elif last_activation == "sigmoid":
+            layers.append(nn.Sigmoid())
+        
+        return nn.Sequential(*layers)
+    
+    else:
+        # Original implementation
+        layers = []
+        for i in range(len(sizes) - 1):
+            in_f, out_f = sizes[i], sizes[i + 1]
+            layers.append(nn.Linear(in_f, out_f))
+            if i < len(sizes) - 2:
+                layers += [nn.LayerNorm(out_f), nn.SiLU(), nn.Dropout(dropout)]
+            else:
+                if last_activation == "relu":
+                    layers += [nn.ReLU()]
+                elif last_activation == "tanh":
+                    layers += [nn.Tanh()]
+                elif last_activation == "sigmoid":
+                    layers += [nn.Sigmoid()]
+        return nn.Sequential(*layers)
 
 
 class AEBatchCorrector(nn.Module):
@@ -212,6 +413,7 @@ class AEBatchCorrector(nn.Module):
         n_labels: Optional[int] = None,
         dropout: float = 0.1,
         adv_lambda: float = 1.0,
+        use_residual: bool = False,
     ):
         super().__init__()
         self.n_labels = n_labels
@@ -219,15 +421,15 @@ class AEBatchCorrector(nn.Module):
 
         enc_sizes = [n_genes] + list(enc_hidden) + [latent_dim]
         dec_sizes = [latent_dim] + list(dec_hidden) + [n_genes]
-        self.encoder = make_mlp(enc_sizes, dropout=dropout, last_activation=None)
-        self.decoder = make_mlp(dec_sizes, dropout=dropout, last_activation=None)
+        self.encoder = make_mlp(enc_sizes, dropout=dropout, last_activation=None, use_residual=use_residual)
+        self.decoder = make_mlp(dec_sizes, dropout=dropout, last_activation=None, use_residual=use_residual)
 
         adv_sizes = [latent_dim] + list(adv_hidden) + [n_batches]
-        self.adv = make_mlp(adv_sizes, dropout=dropout, last_activation=None)
+        self.adv = make_mlp(adv_sizes, dropout=dropout, last_activation=None, use_residual=False)  # Keep simple for adversarial head
 
         if n_labels is not None:
             sup_sizes = [latent_dim] + list(sup_hidden) + [n_labels]
-            self.sup = make_mlp(sup_sizes, dropout=dropout, last_activation=None)
+            self.sup = make_mlp(sup_sizes, dropout=dropout, last_activation=None, use_residual=False)  # Keep simple for supervised head
         else:
             self.sup = None
 
@@ -280,6 +482,12 @@ def train_model(
     wandb_run: Optional[object] = None,
     batch_classes: Optional[list] = None,
     label_classes: Optional[list] = None,
+    cond_min: float = 0.10,
+    overcorr_weight: float = 0.5,
+    bio_weight: float = 0.0,
+    bio_gamma: float = 0.5,
+    adaptive_cond_margin: float = 0.02,
+    adaptive_cond_scale: float = 0.85,
 ) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -364,10 +572,18 @@ def train_model(
     history = {"train_loss": [], "val_loss": [], "val_batch_acc": [], "val_sup_acc": [], "objective_score": []}
 
     last_epoch_batch_acc = None
+    last_epoch_cond_sil = None
     for epoch in range(epochs):
         model.train()
         lam = lambda_at_epoch(epoch, last_b_acc=last_epoch_batch_acc)
+        # If condition separation is weak, further reduce adversarial strength to avoid overcorrection
+        try:
+            if last_epoch_cond_sil is not None and (last_epoch_cond_sil < (cond_min + adaptive_cond_margin)):
+                lam = max(adv_weight * 0.05, lam * adaptive_cond_scale)
+        except Exception:
+            pass
         train_loss = 0.0
+        train_bio = 0.0
         opt.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(train_loader):
@@ -383,10 +599,15 @@ def train_model(
 
             # Only enable autocast when CUDA is available to avoid noisy warnings on CPU-only setups
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled and torch.cuda.is_available()):
-                x_hat, b_logits, l_logits, _ = model(Xb, adv_lambda=lam)
+                x_hat, b_logits, l_logits, z = model(Xb, adv_lambda=lam)
                 loss = recon_loss_fn(x_hat, Xb) + ce_batch(b_logits, Bb)
                 if l_logits is not None and Lb is not None:
                     loss = loss + sup_weight * ce_sup(l_logits, Lb)
+                # Biology-preserving center loss on latent
+                if (Lb is not None) and (bio_weight > 0.0):
+                    bio_l = bio_center_loss(z, Lb, gamma=bio_gamma)
+                    loss = loss + float(bio_weight) * bio_l
+                    train_bio += float(bio_l.detach()) * Xb.size(0)
 
             # Gradient accumulation
             effective_loss = loss / max(1, grad_accum_steps)
@@ -413,6 +634,7 @@ def train_model(
             train_loss += loss.item() * Xb.size(0)
 
         train_loss /= len(train_loader.dataset)
+        train_bio = train_bio / max(1, len(train_loader.dataset)) if bio_weight > 0 else 0.0
 
         # Validation
         model.eval()
@@ -447,6 +669,45 @@ def train_model(
                     all_z.append(z.cpu().numpy())
                 except Exception:
                     pass
+        # Compute silhouette metrics on latent space if available
+        try:
+            if len(all_z) > 0:
+                Z_all = np.concatenate(all_z)
+                b_all = np.concatenate(all_b_true)
+                batch_sil = silhouette_score(Z_all, b_all) if Z_all.shape[0] > 2 else 0.0
+                if all_l_true:
+                    l_all = np.concatenate(all_l_true)
+                    cond_sil = silhouette_score(Z_all, l_all) if len(np.unique(l_all)) > 1 else 0.0
+                else:
+                    cond_sil = 0.0
+            else:
+                batch_sil = 0.0
+                cond_sil = 0.0
+        except Exception:
+            batch_sil = 0.0
+            cond_sil = 0.0
+
+        # Additional kNN and variance-explained metrics on latent embedding
+        try:
+            if len(all_z) > 0:
+                Z_all = np.concatenate(all_z)
+                b_all = np.concatenate(all_b_true)
+                knn_batch_entropy, ilisi_batch, _ = _knn_stats(Z_all, b_all, k=15)
+                batch_eta2 = _eta2_by_group(Z_all, b_all)
+                if all_l_true and len(np.concatenate(all_l_true)) > 0:
+                    l_all = np.concatenate(all_l_true)
+                    knn_label_entropy, clisi_label, knn_label_acc = _knn_stats(Z_all, l_all, k=15)
+                    label_eta2 = _eta2_by_group(Z_all, l_all)
+                else:
+                    knn_label_entropy = clisi_label = knn_label_acc = label_eta2 = np.nan
+            else:
+                knn_batch_entropy = ilisi_batch = batch_eta2 = np.nan
+                knn_label_entropy = clisi_label = knn_label_acc = label_eta2 = np.nan
+        except Exception:
+            knn_batch_entropy = ilisi_batch = batch_eta2 = np.nan
+            knn_label_entropy = clisi_label = knn_label_acc = label_eta2 = np.nan
+
+        cond_minus_batch = (cond_sil - batch_sil) if (not np.isnan(cond_sil)) else -batch_sil
 
         val_loss /= len(val_loader.dataset)
         b_acc = accuracy_score(np.concatenate(all_b_true), np.concatenate(all_b_pred))
@@ -455,18 +716,36 @@ def train_model(
             l_acc = accuracy_score(np.concatenate(all_l_true), np.concatenate(all_l_pred))
         else:
             l_acc = np.nan
+        # Remember cond silhouette for next epoch's lambda adjustment
+        try:
+            last_epoch_cond_sil = float(cond_sil)
+        except Exception:
+            last_epoch_cond_sil = None
 
         # Composite objective_score: maximise label accuracy, minimise val_loss, keep batch acc near target
         # target_acc defined above; penalize deviation
         deviation = abs(b_acc - target_acc)
         label_component = 0.0 if np.isnan(l_acc) else l_acc
         objective_score = label_component - val_loss - deviation
+        # Overcorrection penalty based on condition silhouette falling below threshold
+        try:
+            cond_sil_val = float(cond_sil)  # from silhouette block if computed; else NameError
+        except Exception:
+            cond_sil_val = 0.0
+        over_pen = max(0.0, float(cond_min) - cond_sil_val) * float(overcorr_weight)
+        objective_overcorr = objective_score - over_pen
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_batch_acc"].append(b_acc)
         history["val_sup_acc"].append(l_acc)
         history["objective_score"].append(objective_score)
+        # optional: keep parallel list for penalised metric
+        try:
+            history.setdefault("objective_overcorr", [])
+            history["objective_overcorr"].append(objective_overcorr)
+        except Exception:
+            pass
 
         current_lr = opt.param_groups[0]['lr']
         print(f"Epoch {epoch+1:03d}/{epochs} | "
@@ -482,9 +761,21 @@ def train_model(
                     "val_loss": val_loss,
                     "val_batch_acc": b_acc,
                     "val_sup_acc": l_acc,
+                    "train/bio_loss": train_bio,
+                    "val/cond_sil": float(cond_sil) if 'cond_sil' in locals() else 0.0,
+                    "val/batch_sil": float(batch_sil) if 'batch_sil' in locals() else 0.0,
+                    "val/cond_minus_batch": float(np.nan_to_num(cond_minus_batch, nan=0.0)),
+                    "val/knn_batch_entropy": float(np.nan_to_num(knn_batch_entropy, nan=0.0)),
+                    "val/ilisi_batch": float(np.nan_to_num(ilisi_batch, nan=0.0)),
+                    "val/batch_eta2": float(np.nan_to_num(batch_eta2, nan=0.0)),
+                    "label/knn_entropy": float(np.nan_to_num(knn_label_entropy, nan=0.0)),
+                    "label/knn_acc": float(np.nan_to_num(knn_label_acc, nan=0.0)),
+                    "label/clisi": float(np.nan_to_num(clisi_label, nan=0.0)),
+                    "label/eta2": float(np.nan_to_num(label_eta2, nan=0.0)),
                     "adv_lambda": lam,
                     "lr": current_lr,
                     "objective_score": objective_score,
+                    "objective_overcorr": objective_overcorr,
                 }, step=epoch + 1)
             except Exception:
                 pass
@@ -497,7 +788,7 @@ def train_model(
                 scheduler.step()
 
         # Early stopping logic (supports different metrics). For objective_score and *_acc we maximise; for losses we minimise.
-        if early_stop_metric not in ("val_loss", "val_batch_acc", "val_sup_acc", "objective_score"):
+        if early_stop_metric not in ("val_loss", "val_batch_acc", "val_sup_acc", "objective_score", "objective_overcorr"):
             if wandb_run is not None:
                 try:
                     import wandb  # noqa: F401
@@ -513,9 +804,10 @@ def train_model(
             "val_batch_acc": b_acc,
             "val_sup_acc": l_acc,
             "objective_score": objective_score,
+            "objective_overcorr": objective_overcorr,
         }[early_stop_metric_use]
 
-        maximize = early_stop_metric_use in ("val_batch_acc", "val_sup_acc", "objective_score")
+        maximize = early_stop_metric_use in ("val_batch_acc", "val_sup_acc", "objective_score", "objective_overcorr")
         # Initialize best_val after first metric computed
         if best_val is None:
             best_val = current_metric_value
@@ -864,6 +1156,7 @@ def main():
     ap.add_argument("--recon_loss", default="mse", choices=["mse", "mae", "huber"], help="Reconstruction loss type")
     ap.add_argument("--amp", action="store_true", help="Enable mixed precision (AMP) training on CUDA")
     ap.add_argument("--dropout", default=0.1, type=float, help="Dropout probability for all MLPs")
+    ap.add_argument("--use_residual", action="store_true", help="Use residual connections in autoencoder networks (requires uniform hidden layer sizes)")
     ap.add_argument("--grad_accum", default=1, type=int, help="Gradient accumulation steps")
     ap.add_argument("--num_workers", default=0, type=int, help="DataLoader num_workers")
     ap.add_argument("--pin_memory", action="store_true", help="Enable pin_memory in DataLoaders (CUDA only useful)")
@@ -880,7 +1173,9 @@ def main():
     ap.add_argument("--wandb_log_freq", default=100, type=int, help="How often (batches) to log gradients/params via wandb.watch")
     ap.add_argument("--expected_batches", default=None, type=int, help="Optional: assert the dataset contains exactly this many batches.")
     ap.add_argument("--label_values", default=None, type=str, help="Optional comma-separated expected label values that must appear in each batch (e.g. 'tumor,normal'). If not set, each batch must contain >=2 unique labels when --label_col is provided.")
-    ap.add_argument("--early_stop_metric", default="val_loss", choices=["val_loss", "val_batch_acc", "val_sup_acc", "objective_score"], help="Metric to monitor for early stopping.")
+    ap.add_argument("--early_stop_metric", default="val_loss", choices=["val_loss", "val_batch_acc", "val_sup_acc", "objective_score", "objective_overcorr"], help="Metric to monitor for early stopping.")
+    ap.add_argument("--cond_min", default=0.10, type=float, help="Minimum acceptable condition separation (silhouette) before penalising overcorrection.")
+    ap.add_argument("--overcorr_weight", default=0.5, type=float, help="Penalty weight applied when condition silhouette < cond_min.")
     ap.add_argument("--log_latent_every", default=1, type=int, help="Log latent embedding plot every N epochs (0=disable).")
     # New model variants / VAE+Attention
     ap.add_argument("--model_type", default="ae", choices=["ae", "vae_attention"], help="Base model: adversarial AE or VAE with attention.")
@@ -898,6 +1193,11 @@ def main():
     ap.add_argument("--viz_pca_before", default="pca_before.png", type=str, help="Output path for PCA before correction")
     ap.add_argument("--viz_pca_after", default="pca_after.png", type=str, help="Output path for PCA after correction")
     ap.add_argument("--viz_boxplot", default="logCPM_boxplots.png", type=str, help="Output path for logCPM boxplots")
+    # Differentiable biology preservation loss & adaptive adversary based on cond_sil
+    ap.add_argument("--bio_weight", default=0.0, type=float, help="Weight for supervised center loss on latent (preserve biology)")
+    ap.add_argument("--bio_gamma", default=0.5, type=float, help="Relative weight for between-class separation in center loss")
+    ap.add_argument("--adaptive_cond_margin", default=0.02, type=float, help="If cond silhouette < cond_min + margin, reduce adversarial strength")
+    ap.add_argument("--adaptive_cond_scale", default=0.85, type=float, help="Multiplicative scale on adversarial lambda when condition separation is weak")
     args = ap.parse_args()
 
     # -------- Fallbacks for omitted required-style arguments --------
@@ -946,7 +1246,9 @@ def main():
     batch_classes = batch_cats.cat.categories.tolist()
 
     if args.label_col is not None:
-        label_cats = meta[args.label_col].astype("category")
+        # Normalise label strings to avoid case/whitespace mismatches
+        lbl_series = meta[args.label_col].astype(str).str.strip().str.lower()
+        label_cats = lbl_series.astype("category")
         label_idx = label_cats.cat.codes.values
         label_classes = label_cats.cat.categories.tolist()
     else:
@@ -979,8 +1281,9 @@ def main():
     n_batch_classes = len(np.unique(batch_idx))
     test_count = max(n_batch_classes, int(round(0.2 * n_samples)))
 
-    train_ix, val_ix = train_test_split(
-        np.arange(n_samples), test_size=test_count, random_state=args.seed, stratify=strat
+    train_ix, val_ix = _train_val_split_indices_count(
+        n=n_samples, val_size=test_count, seed=args.seed,
+        label_idx=(label_idx if 'label_idx' in locals() else None), batch_idx=batch_idx
     )
 
     # HVG selection on TRAIN ONLY (applied to all rows)
@@ -1066,6 +1369,7 @@ def main():
             n_labels=(len(label_classes) if label_classes is not None else None),
             dropout=args.dropout,
             adv_lambda=args.adv_weight,
+            use_residual=args.use_residual,
         )
 
     # Optional torch.compile (PyTorch 2+)
@@ -1158,6 +1462,12 @@ def main():
             wandb_run=wandb_run,
             batch_classes=batch_classes,
             label_classes=label_classes,
+            cond_min=args.cond_min,
+            overcorr_weight=args.overcorr_weight,
+            bio_weight=args.bio_weight,
+            bio_gamma=args.bio_gamma,
+            adaptive_cond_margin=args.adaptive_cond_margin,
+            adaptive_cond_scale=args.adaptive_cond_scale,
         )
         model = fit["model"]
 
@@ -1196,7 +1506,9 @@ def main():
         torch.save({"state_dict": model.state_dict(),
                     "batch_classes": batch_classes,
                     "label_classes": (label_classes if args.label_col is not None else None),
-                    "genes": corrected_df.columns.tolist()},
+                    "genes": corrected_df.columns.tolist(),
+                    "scaler": scaler,
+                    "hvg_genes": hvg_genes},
                    args.save_model)
         print(f"[OK] Saved model to: {args.save_model}")
         if args.use_wandb and wandb_run is not None:

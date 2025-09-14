@@ -1,6 +1,7 @@
 # Neural Network Batch Correction (Adversarial Autoencoder)
 <div align="center">
-  
+   <img src= "logo.svg">
+
   [![Tests](https://github.com/stef1949/SimBu/actions/workflows/run-tests.yaml/badge.svg?branch=main)](https://github.com/stef1949/SimBu/actions/workflows/unit-tests.yml)
   [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
   [![View HarmonizeNN Report](https://img.shields.io/badge/W%26B-HarmonizeNN-blue)](https://api.wandb.ai/links/stef1949-sr-richies3d-ltd/xv6g7tlc)
