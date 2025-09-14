@@ -1,0 +1,146 @@
+################################################################################
+# W&B Sweep for legacy AE model with residual connections enabled
+# Targets: NN_batch_correct.py with --use_residual
+# Notes:
+#  - Residual MLP requires uniform hidden sizes for encoder/decoder.
+#  - Uses absolute venv python for consistency on Windows.
+#  - Keeps objective_score as primary metric per existing sweep.
+################################################################################
+
+program: tools/sweep_nn_residual_entry.py
+project: nn-batch-correction
+method: bayes
+metric:
+  name: objective_overcorr
+  goal: maximize
+
+early_terminate:
+  type: hyperband
+  min_iter: 12
+  s: 2
+
+command:
+  - ${env}
+  - C:/Users/stef1/OneDrive/Documents/vscode/NNBatchCorrection/.venv/Scripts/python.exe
+  - tools/sweep_nn_residual_entry.py
+  - --counts
+  - bulk_counts.csv
+  - --metadata
+  - sample_meta.csv
+  - --genes_in_rows
+  - --sample_col
+  - sample
+  - --batch_col
+  - batch
+  - --label_col
+  - condition
+  - --epochs
+  - 100
+  - --out_corrected
+  - corrected_logcpm.csv
+  - --out_latent
+  - latent.csv
+  - --use_wandb
+  - --wandb_log
+  - gradients
+  - --early_stop_metric
+  - objective_overcorr
+  - --log_latent_every
+  - 0
+  - --patience
+  - 25
+  - --min_epochs
+  - 5
+  - --early_stop_delta
+  - 0.002
+  - --use_residual
+  - --amp
+  - --pin_memory
+  # wrapper will generate visualisations after training
+  - ${args}
+
+parameters:
+  # Architecture: use uniform hidden sizes for residual MLPs
+  hvg:
+    values: [3000, 5000, 8000]
+  latent_dim:
+    values: [24, 32, 48]
+  enc_hidden:
+    values: ["256,256,256", "512,512"]
+  dec_hidden:
+    values: ["256,256,256", "512,512"]
+  adv_hidden:
+    values: ["128", "256,64"]
+  sup_hidden:
+    values: ["64", "128"]
+  scheduler:
+    value: cosine_warmup
+  recon_loss:
+    values: ["huber", "mse"]
+  adv_lambda_schedule:
+    values: ["adaptive", "sigmoid"]
+
+  # Continuous / probabilistic
+  dropout:
+    distribution: uniform
+    min: 0.05
+    max: 0.30
+  lr:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.0010
+  weight_decay:
+    values: [0.0, 1e-5, 1e-4]
+
+  # Loss balancing
+  adv_weight:
+    values: [0.6, 0.8, 1.0]
+  sup_weight:
+    values: [1.0, 1.5, 2.0]
+
+  # Training dynamics
+  batch_size:
+    values: [16, 32, 48]
+  adaptive_high_margin:
+    distribution: uniform
+    min: 0.18
+    max: 0.45
+  adaptive_low_margin:
+    distribution: uniform
+    min: 0.03
+    max: 0.09
+
+  # Logging cadence (kept fixed for speed)
+  wandb_log_freq:
+    value: 5
+
+  # Visual output filenames (read by wrapper and passed to visualiser)
+  viz_pca_before:
+    value: pca_before.png
+  viz_pca_after:
+    value: pca_after.png
+  viz_pca_panel:
+    value: pca_panel.png
+  # Multiple seeds for robustness
+  seed:
+    values: [42, 1337]
+  # Overcorrection penalty controls
+  cond_min:
+    values: [0.10, 0.20, 0.30]
+  overcorr_weight:
+    values: [0.5, 1.0]
+  # Differentiable biology-preserving loss and adaptive adversary
+  bio_weight:
+    values: [0.0, 0.1, 0.3, 0.5]
+  bio_gamma:
+    value: 0.5
+  adaptive_cond_margin:
+    values: [0.02, 0.03]
+  adaptive_cond_scale:
+    values: [0.6, 0.7, 0.85]
+
+################################################################################
+# Usage:
+#   pwsh .\run_wandb_sweep.ps1 -Entity <your_entity> -Project nn-batch-correction \
+#       -Yaml wandb_sweep_nn_residual.yaml -Agents 1
+################################################################################

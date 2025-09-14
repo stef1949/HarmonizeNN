@@ -14,8 +14,8 @@ method: bayes
 # Primary objective to maximise: custom metric (condition accuracy - batch leakage)
 metric:
   # Reported metric name logged by the training script
-  name: cond_minus_batch
-  # We want to maximise separation of condition while minimising batch
+  name: objective_overcorr
+  # We want to maximise separation of condition while minimising batch and penalising biology loss
   goal: maximize
 
 # Command template executed per trial. ${env} injects sweep env vars,
@@ -35,9 +35,8 @@ command:
   # (channels_last not beneficial for linear MLPs; omit to reduce clutter)
   - --cudnn_benchmark 
   - --fused_optim
-  - --auto_lr
-  - --auto_lr_metric
-  - reward
+  - --generate_viz
+  - --compile
   # precision supplied via parameter below (removed fixed --precision auto)
   #- --precision=${precision}
   # cuda_graphs removed as sweep parameter because argparse store_true cannot take a value;
@@ -70,6 +69,26 @@ parameters:
   # Output PCA panel figure summarising before/after correction
   viz_pca_panel:
     value: VAEModel/sweep_pca_panel.png
+  viz_pca_before:
+    value: VAEModel/sweep_pca_before.png
+  viz_pca_after:
+    value: VAEModel/sweep_pca_after.png
+  viz_boxplot:
+    value: VAEModel/sweep_boxplots.png
+  # Overcorrection penalty controls
+  cond_min:
+    values: [0.10, 0.20, 0.30]
+  overcorr_weight:
+    values: [0.5, 1.0]
+  # Differentiable biology-preserving loss and adaptive adversary
+  bio_weight:
+    values: [0.0, 0.1, 0.3, 0.5]
+  bio_gamma:
+    values: [0.5]
+  adaptive_cond_margin:
+    values: [0.02, 0.03]
+  adaptive_cond_scale:
+    values: [0.6, 0.7, 0.85]
   # Max training epochs (early stopping may cut short)
   epochs:
     value: 120
@@ -94,6 +113,9 @@ parameters:
   # Supervised condition classifier hidden sizes
   sup_hidden:
     values: ["64", "128"]
+  # Number of attention heads for self-attention block (must divide enc_hidden last size)
+  attention_heads:
+    values: [2, 4, 8]
   # Weight of adversarial loss (higher => stronger batch removal)
   adv_weight:
     min: 1.0
@@ -102,6 +124,9 @@ parameters:
   sup_weight:
     min: 0.5
     max: 2.0
+  # L2 weight decay for AdamW (0 disables)
+  weight_decay:
+    values: [0.0, 0.00001, 0.0001, 0.001]
   # KL divergence annealing weight (log-uniform: explores orders of magnitude)
   kl_weight:
     distribution: log_uniform_values
@@ -113,11 +138,11 @@ parameters:
   # Optimizer learning rate (log-uniform to capture scale sensitivity)
   lr:
     distribution: log_uniform_values
-    min: 0.000001
-    max: 0.002
+    min: 0.00001
+    max: 0.001
   # Mini-batch size (affects gradient noise & memory)
   batch_size:
-    values: [64, 96, 128, 256, 512]
+    values: [32, 64, 128, 256, 512]
   # DataLoader worker processes (tune per CPU resources)
   num_workers:
     value: 6
@@ -126,7 +151,7 @@ parameters:
     value: 4                        # Add if script maps to DataLoader(prefetch_factor=)
   # Mixed precision training
   precision:
-    values: [auto] #  ["auto", "bf16", "fp16"]
+    values: ["auto", "bf16", "fp16"]
   # LR scheduler strategy (cosine with warmup ramp)
   scheduler:
     value: cosine_warmup
@@ -135,13 +160,7 @@ parameters:
     value: 0.05
   # Gradient accumulation steps (effective batch = batch_size * grad_accum)
   grad_accum:
-    value: 1   # Set 1 for maximal throughput; adjust if batch doesn't fit
-  auto_lr_factor:
-    values: [0.5, 0.3]
-  auto_lr_patience:
-    values: [4, 6]
-  auto_min_lr:
-    value: 1e-6
+    values: [1, 2]   # Increase if batch doesn't fit GPU memory
   # Log latent space / projections every N epochs
   log_latent_every:
     value: 5

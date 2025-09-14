@@ -28,7 +28,9 @@ from torch.distributions import NegativeBinomial
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score, accuracy_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn.neighbors import NearestNeighbors
+from sklearn.neighbors import NearestNeighbors
 
 # Optional dependencies: pip install shap wandb
 try:
@@ -91,6 +93,95 @@ def safe_silhouette(X, labels):
         return 0.0
 
 # (Silhouette metrics are computed after each validation epoch once latent vectors are collected.)
+
+def bio_center_loss(z: torch.Tensor, labels: Optional[torch.Tensor], gamma: float = 0.5) -> torch.Tensor:
+    if labels is None or z is None or z.numel() == 0:
+        return z.new_tensor(0.0)
+    classes = torch.unique(labels)
+    if classes.numel() < 2:
+        return z.new_tensor(0.0)
+    within = z.new_tensor(0.0)
+    centers = []
+    for c in classes:
+        mask = (labels == c)
+        if mask.sum() == 0:
+            continue
+        zc = z[mask]
+        center = zc.mean(dim=0, keepdim=True)
+        centers.append(center)
+        diff = zc - center
+        within = within + (diff.pow(2).sum(dim=1).mean())
+    if len(centers) == 0:
+        return z.new_tensor(0.0)
+    within = within / max(1, len(centers))
+    centers_t = torch.cat(centers, dim=0)
+    if centers_t.size(0) > 1:
+        diff = centers_t.unsqueeze(1) - centers_t.unsqueeze(0)
+        d2 = diff.pow(2).sum(dim=2)
+        C = centers_t.size(0)
+        between = (d2.sum() - d2.diag().sum()) / max(1, C * (C - 1))
+    else:
+        between = z.new_tensor(0.0)
+    return within - gamma * between
+def _knn_stats(Z: np.ndarray, labels: np.ndarray, k: int = 15):
+    """Compute kNN entropy (normalized), LISI, and kNN majority accuracy.
+    Works with string labels by mapping to integer codes first.
+    """
+    try:
+        n = Z.shape[0]
+        if n < 3 or labels is None:
+            return np.nan, np.nan, np.nan
+        # Map arbitrary labels -> integer codes 0..C-1
+        labels = np.asarray(labels)
+        classes, inv = np.unique(labels, return_inverse=True)
+        C = int(len(classes))
+        if C <= 1:
+            return np.nan, np.nan, np.nan
+        k_eff = min(int(k), max(2, n - 1))
+        nn = NearestNeighbors(n_neighbors=k_eff + 1, algorithm="auto").fit(Z)
+        idx = nn.kneighbors(Z, return_distance=False)[:, 1:]
+        neigh_codes = inv[idx]  # shape (n, k)
+        H = []  # entropy
+        L = []  # LISI
+        correct = 0
+        for i in range(n):
+            counts = np.bincount(neigh_codes[i], minlength=C).astype(float)
+            p = counts / max(1.0, counts.sum())
+            lisi = 1.0 / np.sum(p * p) if counts.sum() > 0 else np.nan
+            L.append(lisi)
+            mask = p > 0
+            h = -np.sum(p[mask] * np.log(p[mask] + 1e-12)) if counts.sum() > 0 else np.nan
+            h_norm = h / np.log(C) if (C > 1 and not np.isnan(h)) else np.nan
+            H.append(h_norm)
+            maj = int(np.argmax(counts)) if counts.sum() > 0 else -1
+            correct += (maj == int(inv[i]))
+        return float(np.nanmean(H)), float(np.nanmean(L)), float(correct / n)
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+def _eta2_by_group(Z: np.ndarray, groups: np.ndarray):
+    try:
+        n, d = Z.shape
+        if n < 3:
+            return np.nan
+        overall_mean = Z.mean(axis=0)
+        var_total = Z.var(axis=0, ddof=1) + 1e-12
+        eta2_dims = []
+        for g in np.unique(groups):
+            pass
+        # Between-group sum of squares per dim
+        ssb = np.zeros(d, dtype=float)
+        for g in np.unique(groups):
+            idx = (groups == g)
+            ng = idx.sum()
+            if ng == 0:
+                continue
+            diff = Z[idx].mean(axis=0) - overall_mean
+            ssb += ng * (diff ** 2)
+        eta2 = (ssb / (n * var_total)).mean()
+        return float(eta2)
+    except Exception:
+        return np.nan
 
 # ----------------------------
 # Data & Model Components
@@ -237,12 +328,12 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                 sup_weight: float, kl_weight: float, use_amp: bool, scheduler_type: str,
                 patience: int, device: torch.device, save_best_path: Optional[Path] = None,
                 wandb_run: Optional[object] = None, batch_classes: Optional[list] = None,
-                label_classes: Optional[list] = None,
                 log_latent_every: int = 0, grad_accum_steps: int = 1, warmup_ratio: float = 0.1,
                 log_lr_steps: bool = False, use_fused_optim: bool = False, use_cuda_graphs: bool = False,
                 precision_dtype: torch.dtype = torch.float32,
-                auto_lr: bool = False, auto_lr_metric: str = 'reward', auto_lr_factor: float = 0.5,
-                auto_lr_patience: int = 5, auto_min_lr: float = 1e-6):
+                cond_min: float = 0.10, overcorr_weight: float = 0.5,
+                adaptive_cond_margin: float = 0.02, adaptive_cond_scale: float = 0.85,
+                bio_weight: float = 0.0, bio_gamma: float = 0.5):
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     # Optimizer (optionally fused AdamW)
@@ -289,29 +380,34 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
         scheduler = None
 
     best_val_loss, wait = float("inf"), 0
-    # Auto LR tracking (separate from early stopping)
-    best_auto_metric = None
-    auto_wait = 0
 
     import time
     optimizer_steps = 0
+    last_epoch_cond_sil: Optional[float] = None
     for epoch in range(epochs):
         t0 = time.time()
         model.train()
         lam = adv_weight * min(1.0, (epoch + 1) / max(1, epochs // 3))
+        try:
+            if last_epoch_cond_sil is not None and (last_epoch_cond_sil < (cond_min + adaptive_cond_margin)):
+                lam = max(adv_weight * 0.05, lam * adaptive_cond_scale)
+        except Exception:
+            pass
         opt.zero_grad(set_to_none=True)
         # ---- Batch loop ----
         for batch_idx, batch in enumerate(train_loader):
             if not use_cuda_graphs:
                 Xb, Bb, Lb = (batch[0].to(device), batch[1].to(device), batch[2].to(device) if len(batch) > 2 else None)
                 with torch.amp.autocast(device_type='cuda', dtype=precision_dtype, enabled=use_amp and torch.cuda.is_available()):
-                    recon_mu, recon_theta, mu, log_var, b_logits, l_logits, _ = model(Xb, adv_lambda=lam)
+                    recon_mu, recon_theta, mu, log_var, b_logits, l_logits, z = model(Xb, adv_lambda=lam)
                     loss_r = nb_loss(recon_mu, recon_theta, Xb)
                     loss_kl = kl_divergence_loss(mu, log_var)
                     loss_a = ce(b_logits, Bb)
                     total_loss = loss_r + (kl_weight * loss_kl) + (adv_weight * loss_a)
                     if l_logits is not None:
                         total_loss += sup_weight * ce(l_logits, Lb)
+                    if (bio_weight > 0.0) and (Lb is not None):
+                        total_loss += float(bio_weight) * bio_center_loss(z, Lb, gamma=bio_gamma)
                     loss = total_loss
                 if grad_accum_steps > 1:
                     loss = loss / grad_accum_steps
@@ -407,89 +503,64 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                 if all_l_true:
                     all_l_np = np.array(all_l_true)
                     cond_sil = safe_silhouette(all_z_np, all_l_np)
+                    knn_lab_ent, clisi, knn_lab_acc = _knn_stats(all_z_np, all_l_np, k=15)
+                    label_eta2 = _eta2_by_group(all_z_np, all_l_np)
                 else:
-                    cond_sil = 0.0
-                cond_minus_batch_sil = cond_sil - batch_sil
+                    all_l_np = None
+                    cond_sil = np.nan
+                    knn_lab_ent = np.nan
+                    clisi = np.nan
+                    knn_lab_acc = np.nan
+                    label_eta2 = np.nan
+                cond_minus_batch = (0.0 if np.isnan(cond_sil) else cond_sil) - batch_sil
+                knn_batch_ent, ilisi, _ = _knn_stats(all_z_np, all_b_np, k=15)
+                batch_eta2 = _eta2_by_group(all_z_np, all_b_np)
             else:
                 batch_sil = 0.0
-                cond_sil = 0.0
-                cond_minus_batch_sil = 0.0
+                cond_sil = np.nan
+                cond_minus_batch = 0.0
+                knn_batch_ent = ilisi = batch_eta2 = np.nan
+                knn_lab_ent = clisi = knn_lab_acc = label_eta2 = np.nan
         except Exception:
-            batch_sil = cond_sil = cond_minus_batch_sil = 0.0
+            batch_sil = 0.0
+            cond_sil = np.nan
+            cond_minus_batch = 0.0
+            knn_batch_ent = ilisi = batch_eta2 = np.nan
+            knn_lab_ent = clisi = knn_lab_acc = label_eta2 = np.nan
 
-        # Disentanglement / verification metrics
-        chance_batch = 1.0 / max(1, len(batch_classes) if batch_classes else 1)
-        chance_label = 1.0 / max(1, len(label_classes) if (label_classes and not np.isnan(l_acc)) else 1)
-        batch_acc_norm = (b_acc - chance_batch) / max(1e-8, 1 - chance_batch)  # 0 = chance, 1 = perfect
-        if not np.isnan(l_acc):
-            cond_acc_norm = (l_acc - chance_label) / max(1e-8, 1 - chance_label)
-        else:
-            cond_acc_norm = np.nan
-        # We want high condition clustering (cond_sil) and low batch clustering (batch_sil) and low batch accuracy
-        disentangle_score = cond_sil - batch_sil  # higher better
-        # Reward signal combining normalized accuracies (condition up, batch down)
-        if not np.isnan(cond_acc_norm):
-            reward_score = cond_acc_norm - batch_acc_norm
-        else:
-            reward_score = np.nan
+        # Penalised objective to preserve biology (discourage low condition silhouette)
+        try:
+            cond_val = 0.0 if np.isnan(cond_sil) else float(cond_sil)
+        except Exception:
+            cond_val = 0.0
+        objective_overcorr = cond_minus_batch - float(args.overcorr_weight) * max(0.0, float(args.cond_min) - cond_val)
 
+        try:
+            last_epoch_cond_sil = 0.0 if np.isnan(cond_sil) else float(cond_sil)
+        except Exception:
+            last_epoch_cond_sil = None
         t1 = time.time()
         current_lr = opt.param_groups[0]['lr']
         print(f"E {epoch+1:03d} | VLoss {val_loss:.4f} | BAcc {b_acc:.3f}" + (f" | LAcc {l_acc:.3f}" if not np.isnan(l_acc) else "") + f" | LR {current_lr:.2e} | Time {t1-t0:.2f}s")
 
-        # Decide auto metric value (higher is better for reward/disentangle, lower is better for loss)
-        if auto_lr:
-            if auto_lr_metric == 'reward':
-                # Prefer reward_score, else fall back to disentangle_score, else negative val_loss
-                if not np.isnan(reward_score):
-                    current_metric = reward_score
-                    higher_is_better = True
-                elif not np.isnan(disentangle_score):
-                    current_metric = disentangle_score
-                    higher_is_better = True
-                else:
-                    current_metric = -val_loss
-                    higher_is_better = True
-            elif auto_lr_metric == 'disentangle':
-                current_metric = disentangle_score
-                higher_is_better = True
-            else:  # val_loss
-                current_metric = val_loss
-                higher_is_better = False
-            if best_auto_metric is None:
-                best_auto_metric = current_metric
-                auto_wait = 0
-            else:
-                improved = (current_metric > best_auto_metric + 1e-8) if higher_is_better else (current_metric < best_auto_metric - 1e-8)
-                if improved:
-                    best_auto_metric = current_metric
-                    auto_wait = 0
-                else:
-                    auto_wait += 1
-                    if auto_wait >= auto_lr_patience:
-                        old_lr = opt.param_groups[0]['lr']
-                        new_lr = max(auto_min_lr, old_lr * auto_lr_factor)
-                        if new_lr < old_lr - 1e-12:
-                            for g in opt.param_groups:
-                                g['lr'] = new_lr
-                            print(f"[AUTO-LR] Reducing LR from {old_lr:.3e} to {new_lr:.3e} (metric plateau)")
-                            if wandb_run:
-                                try:
-                                    wandb_run.log({"auto_lr/old_lr": old_lr, "auto_lr/new_lr": new_lr, "auto_lr/metric": current_metric, "epoch": epoch+1})
-                                except Exception:
-                                    pass
-                        auto_wait = 0
-
         if wandb_run:
             log_dict = {"epoch": epoch, "val_loss": val_loss, "val_batch_acc": b_acc,
                         "val_recon_loss": val_r/len(val_loader), "val_kl_loss": val_kl/len(val_loader),
-                        "val_adv_loss": val_a/len(val_loader), "grl_lambda": lam}
+                        "val_adv_loss": val_a/len(val_loader), "grl_lambda": lam,
+                        "val/batch_sil": batch_sil,
+                        "val/cond_sil": 0.0 if np.isnan(cond_sil) else cond_sil,
+                        "val/cond_minus_batch": cond_minus_batch,
+                        "val/knn_batch_entropy": float(np.nan_to_num(knn_batch_ent, nan=0.0)),
+                        "val/ilisi_batch": float(np.nan_to_num(ilisi, nan=0.0)),
+                        "val/batch_eta2": float(np.nan_to_num(batch_eta2, nan=0.0)),
+                        "objective_overcorr": objective_overcorr,
+                       }
             if not np.isnan(l_acc):
                 log_dict["val_label_acc"] = l_acc
-                # Keep backwards-compatible key but clarify meaning via additional metrics
-                log_dict["label_minus_batch_acc"] = l_acc - b_acc
-                # Backward compatibility for existing sweeps expecting 'cond_minus_batch'
-                log_dict["cond_minus_batch"] = l_acc - b_acc
+                log_dict["label/knn_entropy"] = float(np.nan_to_num(knn_lab_ent, nan=0.0))
+                log_dict["label/knn_acc"] = float(np.nan_to_num(knn_lab_acc, nan=0.0))
+                log_dict["label/clisi"] = float(np.nan_to_num(clisi, nan=0.0))
+                log_dict["label/eta2"] = float(np.nan_to_num(label_eta2, nan=0.0))
             if log_latent_every > 0 and ((epoch + 1) % log_latent_every == 0):
                 try:
                     Z_cat = np.concatenate(all_z, axis=0)
@@ -498,65 +569,25 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
                     for i, label in enumerate(batch_classes):
                         mask = np.array(all_b_true) == i
                         ax.scatter(pca_z[mask, 0], pca_z[mask, 1], label=label, alpha=0.75, s=12)
-                    # Overlay condition / label markers (shapes) if labels provided
-                    if all_l_true:
-                        labels_arr = np.array(all_l_true)
-                        # Ensure length matches
-                        if labels_arr.shape[0] == pca_z.shape[0]:
-                            uniq_labs = np.unique(labels_arr)
-                            # Determine marker mapping (special-case tumor/normal)
-                            markers_cycle = ["o","s","^","D","v","P","X","*","<",">"]
-                            marker_map = {}
-                            if label_classes:
-                                lower = [c.lower() for c in label_classes]
-                                if 'tumor' in lower and 'normal' in lower:
-                                    for idx, cls in enumerate(label_classes):
-                                        if cls.lower() == 'tumor': marker_map[idx] = '^'
-                                        elif cls.lower() == 'normal': marker_map[idx] = 'o'
-                            for j, lab in enumerate(uniq_labs):
-                                m = marker_map.get(lab, markers_cycle[j % len(markers_cycle)])
-                                lab_name = label_classes[lab] if label_classes and lab < len(label_classes) else str(lab)
-                                mask_l = labels_arr == lab
-                                ax.scatter(pca_z[mask_l, 0], pca_z[mask_l, 1], facecolors='none', edgecolors='k', marker=m,
-                                           s=55, linewidths=0.9, label=f"{lab_name} (label)")
                     ax.legend(fontsize='x-small'); ax.set_title(f'Latent PCA E{epoch+1}'); ax.set_xticks([]); ax.set_yticks([])
                     log_dict["latent_space_pca"] = wandb.Image(fig)
                     plt.close(fig)
                 except Exception as e:
                     print(f"[WARN] Latent viz failed: {e}")
-            # Add disentanglement verification metrics
-            log_dict.update({
+            wandb_run.log(log_dict)
+            wandb_run.log({
                 "val/cond_sil": cond_sil,
                 "val/batch_sil": batch_sil,
-                "val/cond_minus_batch_sil": cond_minus_batch_sil,
-                "val/batch_acc_norm": batch_acc_norm,
-                **({"val/cond_acc_norm": cond_acc_norm} if not np.isnan(cond_acc_norm) else {}),
-                "val/disentangle_score": disentangle_score,
-                **({"val/reward_score": reward_score} if not np.isnan(reward_score) else {}),
-                "val/chance_batch_acc": chance_batch,
-                **({"val/chance_label_acc": chance_label} if not np.isnan(l_acc) else {}),
-                **({"auto_lr/current_metric": current_metric} if auto_lr else {}),
-                **({"auto_lr/best_metric": best_auto_metric} if auto_lr and best_auto_metric is not None else {}),
+                "val/cond_minus_batch": cond_minus_batch,
+                "objective_overcorr": objective_overcorr,
+                "epoch": epoch + 1,
+                "val/loss": val_loss,
             })
-            wandb_run.log(log_dict)
 
         if val_loss < best_val_loss:
             best_val_loss, wait = val_loss, 0
             if save_best_path:
-                try:
-                    parent_dir = Path(save_best_path).parent
-                    if parent_dir and not parent_dir.exists():
-                        parent_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save(model.state_dict(), str(save_best_path))
-                except Exception as e:
-                    import time as _time
-                    fallback = parent_dir / f"{Path(save_best_path).stem}_fallback_{int(_time.time())}.pt" if 'parent_dir' in locals() else Path(f"fallback_model_{int(_time.time())}.pt")
-                    print(f"[WARN] Failed to save model to {save_best_path} ({e}); attempting fallback {fallback}")
-                    try:
-                        torch.save(model.state_dict(), str(fallback))
-                        print(f"[OK] Model saved to fallback path: {fallback}")
-                    except Exception as e2:
-                        print(f"[FATAL] Could not save model checkpoint: {e2}")
+                torch.save(model.state_dict(), save_best_path)
         else:
             wait += 1
             if wait >= patience:
@@ -576,6 +607,54 @@ def train_model(model: VaeAttentionBatchCorrector, train_loader: DataLoader, val
 # ----------------------------
 # Main Execution
 # ----------------------------
+def _train_val_split_indices(n: int, test_size: float, seed: int,
+                             label_idx: Optional[np.ndarray], batch_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return train/val indices ensuring val has both condition classes when available.
+    Tries stratifying by (batch,label) pairs, then by label, then by batch, with fallbacks.
+    """
+    rng = np.random.RandomState(seed)
+    val_size = max(1, int(round(test_size * n)))
+    if label_idx is not None and len(np.unique(label_idx)) < 2:
+        label_idx = None  # no stratification possible on labels
+    # Candidate stratification targets
+    y_pair = None
+    if (label_idx is not None) and (batch_idx is not None) and (len(np.unique(batch_idx)) >= 2):
+        n_labels = int(len(np.unique(label_idx)))
+        y_pair = (batch_idx.astype(int) * n_labels) + label_idx.astype(int)
+    for y in (y_pair, label_idx, batch_idx, None):
+        try:
+            if y is not None:
+                splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=seed)
+                tr, va = next(splitter.split(np.zeros(n), y))
+            else:
+                idx = rng.permutation(n)
+                va, tr = idx[:val_size], idx[val_size:]
+            # Validate label coverage if labels available
+            if label_idx is None:
+                return tr, va
+            if len(np.unique(label_idx[va])) >= 2 and len(np.unique(label_idx[tr])) >= 2:
+                return tr, va
+        except Exception:
+            continue
+    # Last-resort: Force at least one of each label in val
+    if label_idx is not None:
+        classes = np.unique(label_idx)
+        chosen = []
+        for c in classes:
+            idx_c = np.where(label_idx == c)[0]
+            if len(idx_c) > 0:
+                chosen.append(rng.choice(idx_c))
+        # Fill remainder randomly
+        remaining = [i for i in range(n) if i not in set(chosen)]
+        rng.shuffle(remaining)
+        need = max(0, val_size - len(chosen))
+        va = np.array(chosen + remaining[:need], dtype=int)
+        tr = np.array([i for i in range(n) if i not in set(va)], dtype=int)
+        return tr, va
+    # If no labels, return random split
+    idx = rng.permutation(n)
+    va, tr = idx[:val_size], idx[val_size:]
+    return tr, va
 def load_inputs(counts_path, meta_path, sample_col, batch_col, label_col, genes_in_rows):
     """Loads, validates, and aligns counts and metadata."""
     counts = pd.read_csv(counts_path, index_col=0)
@@ -696,26 +775,53 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
     try:
         from sklearn.decomposition import PCA
         import matplotlib.pyplot as plt
-        pca_b = PCA(n_components=2).fit(before_df.values)
-        Zb = pca_b.transform(before_df.values)
-        pca_a = PCA(n_components=2).fit(after_df.values)
-        Za = pca_a.transform(after_df.values)
-        batches = meta.loc[before_df.index, batch_col].astype('category')
+        # Align samples across before/after and meta
+        common = before_df.index.intersection(after_df.index)
+        if len(common) < 2:
+            raise ValueError("PCA panel requires >=2 overlapping samples between before and after")
+        Bf = before_df.loc[common]
+        Af = after_df.loc[common]
+        batches = meta.loc[common, batch_col].astype('category')
+        # Fit a single PCA on concatenated data so axes are comparable
+        from numpy import vstack
+        pca = PCA(n_components=2).fit(vstack([Bf.values, Af.values]))
+        Zb = pca.transform(Bf.values)
+        Za = pca.transform(Af.values)
         batch_codes = batches.cat.codes.values
         batch_names = batches.cat.categories.tolist()
         cmap = plt.get_cmap('tab10')
         fig, axes = plt.subplots(1,2, figsize=(10,5))
-        def draw(ax, Z, title, evr):
+        def _ellipse(ax, pts, color):
+            try:
+                if pts.shape[0] < 3:
+                    return
+                import numpy as _np
+                from numpy.linalg import eig
+                C = _np.cov(pts.T)
+                vals, vecs = eig(C)
+                order = vals.argsort()[::-1]
+                vals, vecs = vals[order], vecs[:,order]
+                import matplotlib.patches as mpatches
+                theta = _np.degrees(_np.arctan2(vecs[1,0], vecs[0,0]))
+                # 2 std dev ellipse
+                width, height = 2.0*_np.sqrt(vals[0])*2, 2.0*_np.sqrt(vals[1])*2
+                e = mpatches.Ellipse(pts.mean(axis=0), width, height, angle=theta,
+                                     edgecolor=color, facecolor='none', lw=1.0, alpha=0.8)
+                ax.add_patch(e)
+            except Exception:
+                pass
+        def draw(ax, Z, title):
             for c in np.unique(batch_codes):
                 mask = batch_codes == c
                 lbl = batch_names[int(c)] if int(c) < len(batch_names) else str(int(c))
-                ax.scatter(Z[mask,0], Z[mask,1], s=18, color=cmap(int(c)%cmap.N), alpha=0.85, label=lbl)
-            ax.set_title(f"{title} (PC1 {evr*100:.1f}%)")
+                ax.scatter(Z[mask,0], Z[mask,1], s=14, color=cmap(int(c)%cmap.N), alpha=0.85, label=lbl)
+                _ellipse(ax, Z[mask], cmap(int(c)%cmap.N))
+            ax.set_title(title)
             ax.set_xticks([]); ax.set_yticks([])
-        draw(axes[0], Zb, 'Before', pca_b.explained_variance_ratio_[0])
-        draw(axes[1], Za, 'After', pca_a.explained_variance_ratio_[0])
+        draw(axes[0], Zb, 'Before')
+        draw(axes[1], Za, 'After')
         if label_col and label_col in meta.columns:
-            labels = meta.loc[before_df.index, label_col].astype('category')
+            labels = meta.loc[common, label_col].astype('category')
             if len(labels.cat.categories) > 1:
                 cats = list(labels.cat.categories)
                 lower = [c.lower() for c in cats]
@@ -738,7 +844,8 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
                 if lbl and lbl not in handles:
                     handles[lbl] = h
         axes[0].legend(handles.values(), handles.keys(), bbox_to_anchor=(1.02,1), loc='upper left', fontsize='small')
-        fig.suptitle(f"PCA Before vs After (HVG {hvg_desc})")
+        evr = pca.explained_variance_ratio_
+        fig.suptitle(f"PCA Before vs After (HVG {hvg_desc}) — EVR: PC1 {evr[0]*100:.1f}%  PC2 {evr[1]*100:.1f}%")
         fig.tight_layout()
         fig.savefig(out_path, dpi=160)
         plt.close(fig)
@@ -793,12 +900,6 @@ def parse_args():
     parser.add_argument("--fused_optim", action="store_true", help="Use fused AdamW optimizer if available (PyTorch 2.0+)")
     parser.add_argument("--cuda_graphs", action="store_true", help="Capture training step with CUDA Graphs (static shapes; disables grad accumulation)")
     parser.add_argument("--run_id", type=str, default=None, help="Optional external run ID for reproducibility")
-    # Auto LR adjustment
-    parser.add_argument("--auto_lr", action="store_true", help="Enable simple adaptive LR reduction on metric plateau")
-    parser.add_argument("--auto_lr_metric", default="reward", choices=["reward","disentangle","val_loss"], help="Metric to monitor for auto LR; reward=reward_score, disentangle=cond_sil-batch_sil")
-    parser.add_argument("--auto_lr_factor", type=float, default=0.5, help="Factor to multiply LR by when reducing")
-    parser.add_argument("--auto_lr_patience", type=int, default=5, help="Epochs without improvement before LR reduction")
-    parser.add_argument("--auto_min_lr", type=float, default=1e-6, help="Lower bound on LR for auto reduction")
     # W&B arguments
     parser.add_argument("--use_wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--wandb_project", default="harmonize-nn-vae", type=str, help="W&B project name")
@@ -814,6 +915,14 @@ def parse_args():
     parser.add_argument("--require_cuda", action="store_true", help="Abort if CUDA not available (helps catch env mismatches in sweeps)")
     parser.add_argument("--fast_start", action="store_true", help="Skip visualisations & latent logging for faster sweeps")
     parser.add_argument("--cache_dir", type=Path, default=None, help="Optional directory to cache logCPM + HVG selection")
+    # Overcorrection penalty controls
+    parser.add_argument("--cond_min", default=0.10, type=float, help="Minimum acceptable condition separation (silhouette) before penalising overcorrection.")
+    parser.add_argument("--overcorr_weight", default=0.5, type=float, help="Penalty weight applied when condition silhouette < cond_min.")
+    # Differentiable biology-preserving loss and adaptive adversary scaling
+    parser.add_argument("--bio_weight", default=0.0, type=float, help="Weight for supervised center loss on latent (preserve biology)")
+    parser.add_argument("--bio_gamma", default=0.5, type=float, help="Relative weight for between-class separation in center loss")
+    parser.add_argument("--adaptive_cond_margin", default=0.02, type=float, help="If cond silhouette < cond_min + margin, reduce adversarial strength")
+    parser.add_argument("--adaptive_cond_scale", default=0.85, type=float, help="Multiplicative scale on adversarial lambda when condition separation is weak")
     return parser.parse_args()
 
 def select_precision(args):
@@ -921,10 +1030,18 @@ def main():
 
     batch_cats = meta[args.batch_col].astype("category")
     batch_idx = batch_cats.cat.codes.values
-    label_idx, label_classes = (meta[args.label_col].astype("category").cat.codes.values, meta[args.label_col].astype("category").cat.categories.tolist()) if args.label_col else (None, None)
+    if args.label_col:
+        # Normalise label strings to avoid hidden whitespace/case issues then categorical-encode
+        lbl_series = meta[args.label_col].astype(str).str.strip().str.lower()
+        cats = lbl_series.astype("category").cat.categories.tolist()
+        label_idx = lbl_series.astype("category").cat.codes.values
+        label_classes = cats
+    else:
+        label_idx, label_classes = (None, None)
 
     # Datasets and Dataloaders (using raw counts_hvg)
-    train_ix, val_ix = train_test_split(np.arange(len(counts_hvg)), test_size=0.2, random_state=args.seed, stratify=batch_idx)
+    train_ix, val_ix = _train_val_split_indices(len(counts_hvg), test_size=0.2, seed=args.seed,
+                                                label_idx=label_idx, batch_idx=batch_idx)
     ds_train = RNADataset(counts_hvg.values[train_ix], batch_idx[train_ix], label_idx[train_ix] if label_idx is not None else None)
     ds_val = RNADataset(counts_hvg.values[val_ix], batch_idx[val_ix], label_idx[val_ix] if label_idx is not None else None)
     # Only enable pin_memory when CUDA is present (otherwise PyTorch warns and it has no effect)
@@ -978,13 +1095,13 @@ def main():
     fit = train_model(model, dl_train, dl_val, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                       adv_weight=args.adv_weight, sup_weight=args.sup_weight, kl_weight=args.kl_weight,
                       use_amp=args.amp, scheduler_type=args.scheduler, patience=args.patience,
-                      save_best_path=args.save_model_path, wandb_run=wandb_run, batch_classes=batch_cats.cat.categories.tolist(), label_classes=label_classes,
-                      device=device,
+                      save_best_path=args.save_model_path, wandb_run=wandb_run, batch_classes=batch_cats.cat.categories.tolist(), device=device,
                       log_latent_every=args.log_latent_every, grad_accum_steps=args.grad_accum, warmup_ratio=args.warmup_ratio,
                       log_lr_steps=args.log_lr_steps, use_fused_optim=args.fused_optim, use_cuda_graphs=args.cuda_graphs,
                       precision_dtype=precision_dtype,
-                      auto_lr=args.auto_lr, auto_lr_metric=args.auto_lr_metric, auto_lr_factor=args.auto_lr_factor,
-                      auto_lr_patience=args.auto_lr_patience, auto_min_lr=args.auto_min_lr)
+                      cond_min=args.cond_min, overcorr_weight=args.overcorr_weight,
+                      adaptive_cond_margin=getattr(args, 'adaptive_cond_margin', 0.02), adaptive_cond_scale=getattr(args, 'adaptive_cond_scale', 0.85),
+                      bio_weight=getattr(args, 'bio_weight', 0.0), bio_gamma=getattr(args, 'bio_gamma', 0.5))
     model = fit["model"]
     t_train_end = time.time()
     print(f"[TIMING] load={t_load1-t_load0:.2f}s preprocess={t_proc-t_load1:.2f}s train_total={t_train_end-t_proc:.2f}s")
@@ -1067,6 +1184,14 @@ def main():
         if args.out_latent: artifact.add_file(args.out_latent)
         if args.save_model_path: artifact.add_file(args.save_model_path)
         if args.out_shap and os.path.exists(args.out_shap): artifact.add_file(args.out_shap)
+        # Include visualisations if generated
+        try:
+            if args.generate_viz:
+                for p in [args.viz_pca_before, args.viz_pca_after, args.viz_pca_panel, args.viz_boxplot]:
+                    if p and isinstance(p, (str, os.PathLike)) and os.path.exists(p):
+                        artifact.add_file(p)
+        except Exception as _e:
+            print(f"[WARN] Unable to attach viz files to artifact: {_e}")
         wandb_run.log_artifact(artifact)
         wandb_run.finish()
 
