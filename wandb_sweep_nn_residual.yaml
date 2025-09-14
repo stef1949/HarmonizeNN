@@ -62,19 +62,27 @@ command:
 parameters:
   # Architecture: use uniform hidden sizes for residual MLPs
   hvg:
-    values: [3000, 5000, 8000]
+    values: [2000, 3000, 5000, 8000]
   latent_dim:
     values: [24, 32, 48]
   enc_hidden:
-    values: ["256,256,256", "512,512"]
+    # Residual requires uniform hidden sizes per MLP
+    values: ["128,128,128", "256,256", "256,256,256", "512,512"]
   dec_hidden:
-    values: ["256,256,256", "512,512"]
+    values: ["128,128,128", "256,256", "256,256,256", "512,512"]
   adv_hidden:
     values: ["128", "256,64"]
   sup_hidden:
     values: ["64", "128"]
   scheduler:
-    value: cosine_warmup
+    values: [cosine_warmup, cosine, plateau]
+  warmup_ratio:
+    # Only used when scheduler=cosine_warmup
+    distribution: uniform
+    min: 0.05
+    max: 0.20
+  grad_accum:
+    values: [1, 2, 4]
   recon_loss:
     values: ["huber", "mse"]
   adv_lambda_schedule:
