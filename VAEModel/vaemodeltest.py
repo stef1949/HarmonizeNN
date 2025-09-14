@@ -781,6 +781,12 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
             raise ValueError("PCA panel requires >=2 overlapping samples between before and after")
         Bf = before_df.loc[common]
         Af = after_df.loc[common]
+        # Align gene/features by intersection to avoid shape mismatch
+        common_genes = Bf.columns.intersection(Af.columns)
+        if len(common_genes) < 2:
+            raise ValueError("PCA panel requires >=2 overlapping genes between before and after matrices")
+        Bf = Bf.loc[:, common_genes]
+        Af = Af.loc[:, common_genes]
         batches = meta.loc[common, batch_col].astype('category')
         # Fit a single PCA on concatenated data so axes are comparable
         from numpy import vstack
@@ -791,6 +797,10 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
         batch_names = batches.cat.categories.tolist()
         cmap = plt.get_cmap('tab10')
         fig, axes = plt.subplots(1,2, figsize=(10,5))
+        # shared axis limits for comparability
+        allZ = np.vstack([Zb, Za])
+        xlim = (allZ[:,0].min()*1.05, allZ[:,0].max()*1.05)
+        ylim = (allZ[:,1].min()*1.05, allZ[:,1].max()*1.05)
         def _ellipse(ax, pts, color):
             try:
                 if pts.shape[0] < 3:
@@ -818,6 +828,7 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
                 _ellipse(ax, Z[mask], cmap(int(c)%cmap.N))
             ax.set_title(title)
             ax.set_xticks([]); ax.set_yticks([])
+            ax.set_xlim(*xlim); ax.set_ylim(*ylim)
         draw(axes[0], Zb, 'Before')
         draw(axes[1], Za, 'After')
         if label_col and label_col in meta.columns:
@@ -845,7 +856,11 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
                     handles[lbl] = h
         axes[0].legend(handles.values(), handles.keys(), bbox_to_anchor=(1.02,1), loc='upper left', fontsize='small')
         evr = pca.explained_variance_ratio_
-        fig.suptitle(f"PCA Before vs After (HVG {hvg_desc}) — EVR: PC1 {evr[0]*100:.1f}%  PC2 {evr[1]*100:.1f}%")
+        n_samp = len(common)
+        n_gen = len(common_genes)
+        fig.suptitle(
+            f"PCA Before vs After (HVG {hvg_desc}) — EVR: PC1 {evr[0]*100:.1f}%  PC2 {evr[1]*100:.1f}%  |  n={n_samp} samples, g={n_gen} genes"
+        )
         fig.tight_layout()
         fig.savefig(out_path, dpi=160)
         plt.close(fig)

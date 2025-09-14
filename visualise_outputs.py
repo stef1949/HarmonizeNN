@@ -74,36 +74,26 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
         return
     Bf = before_df.loc[common]
     Af = after_df.loc[common]
+    # Align features robustly by inner-joining on gene columns
+    Bf, Af = Bf.align(Af, join='inner', axis=1)
+    if Bf.shape[1] < 2:
+        print("[WARN] PCA panel skipped: fewer than 2 overlapping genes between before/after matrices.")
+        return
     batches = meta.loc[common, batch_col].astype('category')
     batch_codes = batches.cat.codes.values
     batch_names = batches.cat.categories.tolist()
-    pca = PCA(n_components=2).fit(np.vstack([Bf.values, Af.values]))
-    Zb = pca.transform(Bf.values)
-    Za = pca.transform(Af.values)
+    # Fit separate PCAs per view to allow different scales/bases
+    pca_b = PCA(n_components=2).fit(Bf.values)
+    pca_a = PCA(n_components=2).fit(Af.values)
+    Zb = pca_b.transform(Bf.values)
+    Za = pca_a.transform(Af.values)
     cmap = plt.get_cmap('tab10')
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.5), sharex=False, sharey=False)
-    def _ellipse(ax, pts, color):
-        try:
-            if pts.shape[0] < 3:
-                return
-            C = np.cov(pts.T)
-            vals, vecs = np.linalg.eig(C)
-            order = np.argsort(vals)[::-1]
-            vals, vecs = vals[order], vecs[:,order]
-            theta = np.degrees(np.arctan2(vecs[1,0], vecs[0,0]))
-            import matplotlib.patches as mpatches
-            width, height = 2.0*np.sqrt(vals[0])*2, 2.0*np.sqrt(vals[1])*2
-            e = mpatches.Ellipse(pts.mean(axis=0), width, height, angle=theta,
-                                 edgecolor=color, facecolor='none', lw=1.0, alpha=0.8)
-            ax.add_patch(e)
-        except Exception:
-            pass
     for ax, Z, ttl in zip(axes, [Zb, Za], ["Before", "After"]):
         for c in np.unique(batch_codes):
             mask = batch_codes == c
             lbl = batch_names[int(c)] if int(c) < len(batch_names) else str(int(c))
             ax.scatter(Z[mask, 0], Z[mask, 1], s=10, color=cmap(int(c) % cmap.N), label=lbl, alpha=0.85)
-            _ellipse(ax, Z[mask], cmap(int(c) % cmap.N))
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_title(ttl)
     # Optional label overlays with distinct marker shapes
@@ -132,8 +122,11 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
         handles.append(plt.Line2D([0], [0], marker='o', color='w', label=lbl, markerfacecolor=cmap(int(c) % cmap.N), markersize=6))
         labels.append(lbl)
     axes[0].legend(handles, labels, bbox_to_anchor=(1.02, 1), loc='upper left', fontsize='small')
-    evr = pca.explained_variance_ratio_
-    fig.suptitle(f"{title} — EVR: PC1 {evr[0]*100:.1f}%  PC2 {evr[1]*100:.1f}%")
+    evr_b = pca_b.explained_variance_ratio_
+    evr_a = pca_a.explained_variance_ratio_
+    fig.suptitle(
+        f"{title} — Before PC1 {evr_b[0]*100:.1f}%, PC2 {evr_b[1]*100:.1f}% | After PC1 {evr_a[0]*100:.1f}%, PC2 {evr_a[1]*100:.1f}%"
+    )
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
