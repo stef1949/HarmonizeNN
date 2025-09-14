@@ -178,25 +178,82 @@ class GradReverseLayer(nn.Module):
 # Model
 # ----------------------------
 
-def make_mlp(sizes, dropout=0.0, last_activation=None):
+class ResidualBlock(nn.Module):
+    """
+    Residual block with skip connection: x + FFN(x) + LayerNorm
+    """
+    def __init__(self, hidden_size: int, dropout: float = 0.0):
+        super().__init__()
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Dropout(dropout)
+        )
+        self.layer_norm = nn.LayerNorm(hidden_size)
+    
+    def forward(self, x):
+        return self.layer_norm(x + self.ffn(x))
+
+
+def make_mlp(sizes, dropout=0.0, last_activation=None, use_residual=False):
     """
     Hidden layers: Linear -> LayerNorm -> SiLU -> Dropout
     Output layer: optional activation per arg
+    
+    If use_residual=True, uses ResidualBlock layers instead.
+    Note: For residual connections to work, all hidden layer sizes must be the same.
     """
-    layers = []
-    for i in range(len(sizes) - 1):
-        in_f, out_f = sizes[i], sizes[i + 1]
-        layers.append(nn.Linear(in_f, out_f))
-        if i < len(sizes) - 2:
-            layers += [nn.LayerNorm(out_f), nn.SiLU(), nn.Dropout(dropout)]
-        else:
-            if last_activation == "relu":
-                layers += [nn.ReLU()]
-            elif last_activation == "tanh":
-                layers += [nn.Tanh()]
-            elif last_activation == "sigmoid":
-                layers += [nn.Sigmoid()]
-    return nn.Sequential(*layers)
+    if use_residual:
+        if len(sizes) < 3:
+            raise ValueError("Residual networks need at least input, hidden, and output layers")
+        
+        # Check that all hidden layers have the same size for residual connections
+        hidden_sizes = sizes[1:-1]
+        if len(set(hidden_sizes)) > 1:
+            raise ValueError(f"For residual connections, all hidden layer sizes must be the same. Got: {hidden_sizes}")
+        
+        hidden_size = hidden_sizes[0]
+        num_hidden_layers = len(hidden_sizes)
+        
+        layers = []
+        
+        # Input projection to hidden size
+        layers.append(nn.Linear(sizes[0], hidden_size))
+        layers.extend([nn.LayerNorm(hidden_size), nn.SiLU(), nn.Dropout(dropout)])
+        
+        # Residual blocks
+        for _ in range(num_hidden_layers):
+            layers.append(ResidualBlock(hidden_size, dropout))
+        
+        # Output layer
+        layers.append(nn.Linear(hidden_size, sizes[-1]))
+        if last_activation == "relu":
+            layers.append(nn.ReLU())
+        elif last_activation == "tanh":
+            layers.append(nn.Tanh())
+        elif last_activation == "sigmoid":
+            layers.append(nn.Sigmoid())
+        
+        return nn.Sequential(*layers)
+    
+    else:
+        # Original implementation
+        layers = []
+        for i in range(len(sizes) - 1):
+            in_f, out_f = sizes[i], sizes[i + 1]
+            layers.append(nn.Linear(in_f, out_f))
+            if i < len(sizes) - 2:
+                layers += [nn.LayerNorm(out_f), nn.SiLU(), nn.Dropout(dropout)]
+            else:
+                if last_activation == "relu":
+                    layers += [nn.ReLU()]
+                elif last_activation == "tanh":
+                    layers += [nn.Tanh()]
+                elif last_activation == "sigmoid":
+                    layers += [nn.Sigmoid()]
+        return nn.Sequential(*layers)
 
 
 class AEBatchCorrector(nn.Module):
@@ -212,6 +269,7 @@ class AEBatchCorrector(nn.Module):
         n_labels: Optional[int] = None,
         dropout: float = 0.1,
         adv_lambda: float = 1.0,
+        use_residual: bool = False,
     ):
         super().__init__()
         self.n_labels = n_labels
@@ -219,15 +277,15 @@ class AEBatchCorrector(nn.Module):
 
         enc_sizes = [n_genes] + list(enc_hidden) + [latent_dim]
         dec_sizes = [latent_dim] + list(dec_hidden) + [n_genes]
-        self.encoder = make_mlp(enc_sizes, dropout=dropout, last_activation=None)
-        self.decoder = make_mlp(dec_sizes, dropout=dropout, last_activation=None)
+        self.encoder = make_mlp(enc_sizes, dropout=dropout, last_activation=None, use_residual=use_residual)
+        self.decoder = make_mlp(dec_sizes, dropout=dropout, last_activation=None, use_residual=use_residual)
 
         adv_sizes = [latent_dim] + list(adv_hidden) + [n_batches]
-        self.adv = make_mlp(adv_sizes, dropout=dropout, last_activation=None)
+        self.adv = make_mlp(adv_sizes, dropout=dropout, last_activation=None, use_residual=False)  # Keep simple for adversarial head
 
         if n_labels is not None:
             sup_sizes = [latent_dim] + list(sup_hidden) + [n_labels]
-            self.sup = make_mlp(sup_sizes, dropout=dropout, last_activation=None)
+            self.sup = make_mlp(sup_sizes, dropout=dropout, last_activation=None, use_residual=False)  # Keep simple for supervised head
         else:
             self.sup = None
 
@@ -864,6 +922,7 @@ def main():
     ap.add_argument("--recon_loss", default="mse", choices=["mse", "mae", "huber"], help="Reconstruction loss type")
     ap.add_argument("--amp", action="store_true", help="Enable mixed precision (AMP) training on CUDA")
     ap.add_argument("--dropout", default=0.1, type=float, help="Dropout probability for all MLPs")
+    ap.add_argument("--use_residual", action="store_true", help="Use residual connections in autoencoder networks (requires uniform hidden layer sizes)")
     ap.add_argument("--grad_accum", default=1, type=int, help="Gradient accumulation steps")
     ap.add_argument("--num_workers", default=0, type=int, help="DataLoader num_workers")
     ap.add_argument("--pin_memory", action="store_true", help="Enable pin_memory in DataLoaders (CUDA only useful)")
@@ -1066,6 +1125,7 @@ def main():
             n_labels=(len(label_classes) if label_classes is not None else None),
             dropout=args.dropout,
             adv_lambda=args.adv_weight,
+            use_residual=args.use_residual,
         )
 
     # Optional torch.compile (PyTorch 2+)
@@ -1196,7 +1256,9 @@ def main():
         torch.save({"state_dict": model.state_dict(),
                     "batch_classes": batch_classes,
                     "label_classes": (label_classes if args.label_col is not None else None),
-                    "genes": corrected_df.columns.tolist()},
+                    "genes": corrected_df.columns.tolist(),
+                    "scaler": scaler,
+                    "hvg_genes": hvg_genes},
                    args.save_model)
         print(f"[OK] Saved model to: {args.save_model}")
         if args.use_wandb and wandb_run is not None:
