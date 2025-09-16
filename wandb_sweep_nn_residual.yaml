@@ -35,7 +35,7 @@ command:
   - --label_col
   - condition
   - --epochs
-  - 5
+  - 40
   - --out_corrected
   - artifacts/outputs/corrected_logcpm.csv
   - --out_latent
@@ -98,7 +98,7 @@ parameters:
   lr:
     distribution: log_uniform_values
     min: 0.00001
-    max: 0.00009
+    max: 0.00004
   weight_decay:
     values: [0.0, 1e-5, 1e-4]
 
@@ -147,7 +147,7 @@ parameters:
   adaptive_cond_margin:
     values: [0.05, 0.08]
   adaptive_cond_scale:
-    values: [0.4, 0.5, 0.6]
+    values: [0.3, 0.4, 0.5]
 
 ################################################################################
 # Usage:
