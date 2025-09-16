@@ -70,7 +70,7 @@ GENE2,250,200,180,...
 ```bash
 # Apply trained model to test data
 python predict.py \
-    --model_path experiments/best_model.pt \
+    --model_path artifacts/checkpoints/best_model.pt \
     --counts_path data/test_counts.csv \
     --out_path results/corrected_test.csv
 ```
@@ -89,7 +89,7 @@ python predict.py \
 ```bash
 # Handle data where genes are in rows
 python predict.py \
-    --model_path trained_model.pt \
+    --model_path artifacts/checkpoints/trained_model.pt \
     --counts_path data/transposed_counts.csv \
     --out_path results/corrected_output.csv \
     --genes_in_rows

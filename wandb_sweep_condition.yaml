@@ -19,9 +19,9 @@ command:
 
 parameters:
   counts:
-    value: bulk_counts.csv
+    value: data/bulk_counts.csv
   metadata:
-    value: sample_meta.csv
+    value: data/sample_meta.csv
   sample_col:
     value: sample
   batch_col:
@@ -31,13 +31,13 @@ parameters:
   out_corrected:
     value: sweep_corrected.csv
   out_latent:
-    value: sweep_latent.csv
+    value: artifacts/outputs/sweep_latent.csv
   viz_pca_panel:
-    value: sweep_pca_panel.png
+    value: artifacts/outputs/sweep_pca_panel.png
   viz_pca_before:
-    value: sweep_pca_before.png
+    value: artifacts/outputs/sweep_pca_before.png
   viz_pca_after:
-    value: sweep_pca_after.png
+    value: artifacts/outputs/sweep_pca_after.png
   viz_boxplot:
     value: sweep_boxplots.png
   # Overcorrection penalty controls

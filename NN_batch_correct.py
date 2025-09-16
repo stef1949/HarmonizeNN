@@ -35,6 +35,8 @@ import matplotlib.pyplot as plt
 from matplotlib import gridspec
 from typing import Dict
 
+from paths import DATA_DIR, OUTPUTS_DIR, project_relative
+
 import torch
 import torch.nn as nn
 from models import AEBatchCorrector, GradReverseLayer, ResidualBlock, make_mlp
@@ -994,8 +996,8 @@ def load_inputs(
 
 def main():
     ap = argparse.ArgumentParser(description="Neural network bulk RNA-seq batch correction (adversarial autoencoder).")
-    ap.add_argument("--counts", default=None, type=Path, help="Counts matrix CSV (genes x samples OR samples x genes). If omitted, will look for 'bulk_counts.csv'.")
-    ap.add_argument("--metadata", default=None, type=Path, help="Sample metadata CSV with at least [sample,batch]. If omitted, will look for 'sample_meta.csv'.")
+    ap.add_argument("--counts", default=None, type=Path, help="Counts matrix CSV (genes x samples OR samples x genes). If omitted, will look for 'data/bulk_counts.csv'.")
+    ap.add_argument("--metadata", default=None, type=Path, help="Sample metadata CSV with at least [sample,batch]. If omitted, will look for 'data/sample_meta.csv'.")
     ap.add_argument("--sample_col", default="sample", type=str, help="Column in metadata that has sample IDs.")
     ap.add_argument("--batch_col", default="batch", type=str, help="Column in metadata that has batch IDs.")
     ap.add_argument("--label_col", default=None, type=str, help="Optional biological label column (condition).")
@@ -1032,7 +1034,7 @@ def main():
     ap.add_argument("--stop_on_negative", action="store_true", help="Terminate early when the monitored early_stop_metric becomes negative.")
     ap.add_argument("--seed", default=42, type=int)
     ap.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2+) for speed")
-    ap.add_argument("--out_corrected", default=None, type=Path, help="Output CSV path for corrected matrix (logCPM scale). Defaults to 'corrected_logcpm.csv' if omitted.")
+    ap.add_argument("--out_corrected", default=None, type=Path, help="Output CSV path for corrected matrix (logCPM scale). Defaults to 'artifacts/outputs/corrected_logcpm.csv' if omitted.")
     ap.add_argument("--out_latent", default=None, type=Path, help="Optional CSV for latent embedding.")
     ap.add_argument("--save_model", default=None, type=Path, help="Optional path to save trained model .pt")
     ap.add_argument("--use_wandb", action="store_true", help="Log training and artifacts to Weights & Biases")
@@ -1057,10 +1059,11 @@ def main():
     # Visualization after training
     ap.add_argument("--generate_viz", action="store_true", help="Generate PCA and boxplot visualisations after training using the visualiser module")
     ap.add_argument("--viz_hvg_top", default=2000, type=int, help="Top-N most variable genes to use for PCA visualisations (0=use all)")
-    ap.add_argument("--viz_pca_before", default="pca_before.png", type=str, help="Output path for PCA before correction")
-    ap.add_argument("--viz_pca_after", default="pca_after.png", type=str, help="Output path for PCA after correction")
+    ap.add_argument("--viz_pca_before", default=OUTPUTS_DIR / "pca_before.png", type=Path, help="Output path for PCA before correction")
+    ap.add_argument("--viz_pca_after", default=OUTPUTS_DIR / "pca_after.png", type=Path, help="Output path for PCA after correction")
+    ap.add_argument("--viz_pca_panel", default=OUTPUTS_DIR / "pca_panel.png", type=Path, help="Output path for combined before/after PCA panel")
     # Accept optional value; if provided without a path, use the default filename
-    ap.add_argument("--viz_boxplot", nargs="?", const="logCPM_boxplots.png", default="logCPM_boxplots.png", type=str, help="Output path for logCPM boxplots (optional value)")
+    ap.add_argument("--viz_boxplot", nargs="?", const=OUTPUTS_DIR / "logCPM_boxplots.png", default=OUTPUTS_DIR / "logCPM_boxplots.png", type=Path, help="Output path for logCPM boxplots (optional value)")
     # Differentiable biology preservation loss & adaptive adversary based on cond_sil
     ap.add_argument("--bio_weight", default=0.0, type=float, help="Weight for supervised center loss on latent (preserve biology)")
     ap.add_argument("--bio_gamma", default=0.5, type=float, help="Relative weight for between-class separation in center loss")
@@ -1070,22 +1073,50 @@ def main():
 
     # -------- Fallbacks for omitted required-style arguments --------
     if args.counts is None:
-        default_counts = Path("bulk_counts.csv")
+        default_counts = DATA_DIR / "bulk_counts.csv"
         if default_counts.exists():
             args.counts = default_counts
             print(f"[INFO] Using default counts file: {default_counts}")
         else:
-            raise SystemExit("ERROR: --counts not provided and 'bulk_counts.csv' not found.")
+            raise SystemExit("ERROR: --counts not provided and 'data/bulk_counts.csv' not found.")
+    else:
+        args.counts = project_relative(args.counts)
+
     if args.metadata is None:
-        default_meta = Path("sample_meta.csv")
+        default_meta = DATA_DIR / "sample_meta.csv"
         if default_meta.exists():
             args.metadata = default_meta
             print(f"[INFO] Using default metadata file: {default_meta}")
         else:
-            raise SystemExit("ERROR: --metadata not provided and 'sample_meta.csv' not found.")
+            raise SystemExit("ERROR: --metadata not provided and 'data/sample_meta.csv' not found.")
+    else:
+        args.metadata = project_relative(args.metadata)
+
     if args.out_corrected is None:
-        args.out_corrected = Path("corrected_logcpm.csv")
+        args.out_corrected = OUTPUTS_DIR / "corrected_logcpm.csv"
         print(f"[INFO] Using default output path: {args.out_corrected}")
+    else:
+        args.out_corrected = project_relative(args.out_corrected)
+
+    args.out_corrected = Path(args.out_corrected)
+    args.out_corrected.parent.mkdir(parents=True, exist_ok=True)
+
+    for attr in ("out_latent", "out_shap", "save_model"):
+        value = getattr(args, attr, None)
+        if value:
+            value = project_relative(value)
+            value = Path(value)
+            value.parent.mkdir(parents=True, exist_ok=True)
+            setattr(args, attr, value)
+
+    for attr in ("viz_pca_before", "viz_pca_after", "viz_pca_panel", "viz_boxplot"):
+        value = getattr(args, attr, None)
+        if value:
+            value = project_relative(value)
+            value = Path(value)
+            value.parent.mkdir(parents=True, exist_ok=True)
+            setattr(args, attr, value)
+
 
     # Early validation to avoid deep pandas traceback
     try:

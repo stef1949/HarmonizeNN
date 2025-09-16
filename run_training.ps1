@@ -19,8 +19,8 @@ if (-not $Env:WANDB_PROJECT) { $Env:WANDB_PROJECT = 'nn-batch-correction' }
 
 # Core run command
 python NN_batch_correct.py `
-  --counts bulk_counts.csv `
-  --metadata sample_meta.csv `
+  --counts data/bulk_counts.csv `
+  --metadata data/sample_meta.csv `
   --genes_in_rows `
   --sample_col sample `
   --batch_col batch `
@@ -41,8 +41,8 @@ python NN_batch_correct.py `
   --pin_memory `
   --adv_lambda_schedule adaptive `
   --grad_accum 1 `
-  --out_corrected corrected_logcpm.csv `
-  --out_latent latent.csv `
+  --out_corrected artifacts/outputs/corrected_logcpm.csv `
+  --out_latent artifacts/outputs/latent.csv `
   --use_wandb `
   --wandb_log gradients `
   --wandb_log_freq 1 `

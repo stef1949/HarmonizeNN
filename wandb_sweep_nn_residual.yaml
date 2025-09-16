@@ -24,9 +24,9 @@ command:
   - C:/Users/stef1/OneDrive/Documents/vscode/NNBatchCorrection/.venv/Scripts/python.exe
   - tools/sweep_nn_residual_entry.py
   - --counts
-  - bulk_counts.csv
+  - data/bulk_counts.csv
   - --metadata
-  - sample_meta.csv
+  - data/sample_meta.csv
   - --genes_in_rows
   - --sample_col
   - sample
@@ -37,9 +37,9 @@ command:
   - --epochs
   - 5
   - --out_corrected
-  - corrected_logcpm.csv
+  - artifacts/outputs/corrected_logcpm.csv
   - --out_latent
-  - latent.csv
+  - artifacts/outputs/latent.csv
   - --use_wandb
   - --wandb_log
   - gradients
@@ -97,8 +97,8 @@ parameters:
     max: 0.12
   lr:
     distribution: log_uniform_values
-    min: 0.0007
-    max: 0.0009
+    min: 0.00001
+    max: 0.00009
   weight_decay:
     values: [0.0, 1e-5, 1e-4]
 
@@ -126,11 +126,11 @@ parameters:
 
   # Visual output filenames (read by wrapper and passed to visualiser)
   viz_pca_before:
-    value: pca_before.png
+    value: artifacts/outputs/pca_before.png
   viz_pca_after:
-    value: pca_after.png
+    value: artifacts/outputs/pca_after.png
   viz_pca_panel:
-    value: pca_panel.png
+    value: artifacts/outputs/pca_panel.png
   # Multiple seeds for robustness
   seed:
     values: [42, 1337]

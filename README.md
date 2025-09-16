@@ -1,6 +1,6 @@
 # Neural Network Batch Correction (Adversarial Autoencoder)
 <div align="center">
-   <img src= "logo.svg">
+   <img src="assets/logo.svg">
 
   [![Tests](https://github.com/stef1949/SimBu/actions/workflows/run-tests.yaml/badge.svg?branch=main)](https://github.com/stef1949/SimBu/actions/workflows/unit-tests.yml)
   [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -8,8 +8,8 @@
 </div>
 
 <p align=center>
-<img src="logCPM_boxplots.png" alt="LogCPM Boxplots" height="200" align=center />
-<img src="assets\pca_panel.png" alt="Before & After PCA Plots" height="200" align=center />
+<img src="assets/logCPM_boxplots.png" alt="LogCPM Boxplots" height="200" align=center />
+<img src="assets/pca_panel.png" alt="Before & After PCA Plots" height="200" align=center />
 </p>
 
 An adversarial autoencoder for bulk RNA-seq batch effect correction. It learns a latent representation that preserves biological signal (optional supervised head) while discouraging batch-specific variation via a gradient reversal adversary. Outputs a batch-corrected expression matrix (logCPM scale) and optional latent embedding plus visual diagnostics.
@@ -37,14 +37,12 @@ An adversarial autoencoder for bulk RNA-seq batch effect correction. It learns a
 - `models/`              Model components (adversarial AE) and factory
   - `models/ae.py`      AEBatchCorrector, GradReverseLayer, ResidualBlock, make_mlp
   - `models/factory.py` Helper to build AE or VAE+Attention models from CLI args
-- `visualise.py`         Standalone PCA / boxplot + architecture diagram utilities
-- `bulk_counts.csv`      Example counts matrix (shape: genes × samples or samples × genes)
-- `sample_meta.csv`      Example metadata (columns include sample,batch[,condition])
-- `corrected_*.csv`      Example outputs (logCPM after correction)
-- `latent*.csv`          Saved latent embeddings
-- `nn_architecture.png`  Autoencoder + adversary schematic
-- `pca_before.png` / `pca_after.png`  PCA plots pre/post correction
-- `logCPM_boxplots.png`  Distribution comparison of logCPM per batch
+- `data/`               Example inputs (`data/bulk_counts.csv`, `data/sample_meta.csv`, `data/test_counts.csv`, `data/test_meta.csv`)
+- `artifacts/outputs/`  Generated demo outputs (`corrected_logcpm.csv`, `latent*.csv`, `pca_*.png`, `logCPM_boxplots.png`)
+- `artifacts/checkpoints/` Example trained weights (`trained_model.pt`, `model_best.pt`, `best_model.pt`)
+- `assets/`             README assets (logo, PCA panel)
+- `visualise.py`        Standalone PCA/boxplot + architecture diagram utilities
+
 
 ---
 ## Input Formats
@@ -83,17 +81,17 @@ Optional extras:
 Minimal unsupervised run (only batches):
 ```powershell
 python NN_batch_correct.py `
-  --counts bulk_counts.csv `
-  --metadata sample_meta.csv `
+  --counts data/bulk_counts.csv `
+  --metadata data/sample_meta.csv `
   --genes_in_rows `
-  --out_corrected corrected_logCPM.csv
+  --out_corrected artifacts/outputs/corrected_logcpm.csv
 ```
 
 With supervised label preservation + latent export + model save + visualisations:
 ```powershell
 python NN_batch_correct.py `
-  --counts bulk_counts.csv `
-  --metadata sample_meta.csv `
+  --counts data/bulk_counts.csv `
+  --metadata data/sample_meta.csv `
   --genes_in_rows `
   --label_col condition `
   --hvg 5000 `
@@ -109,8 +107,8 @@ python NN_batch_correct.py `
   --batch_size 64 `
   --dropout 0.1 `
   --recon_loss mse `
-  --out_corrected corrected_logCPM.csv `
-  --out_latent latent.csv `
+  --out_corrected artifacts/outputs/corrected_logcpm.csv `
+  --out_latent artifacts/outputs/latent.csv `
   --save_model model_best.pt `
   --generate_viz `
   --viz_hvg_top 2000
@@ -120,14 +118,14 @@ Enable AMP (CUDA) + cosine scheduler + W&B logging:
 ```powershell
 $env:WANDB_MODE="offline"  # optional
 python NN_batch_correct.py `
-  --counts bulk_counts.csv `
-  --metadata sample_meta.csv `
+  --counts data/bulk_counts.csv `
+  --metadata data/sample_meta.csv `
   --genes_in_rows `
   --adv_lambda_schedule sigmoid `
   --scheduler cosine `
   --amp `
   --use_wandb `
-  --out_corrected corrected_logCPM.csv
+  --out_corrected artifacts/outputs/corrected_logcpm.csv
 ```
 
 ---
@@ -166,10 +164,10 @@ Run `python NN_batch_correct.py -h` for the full list.
 You can run it standalone (e.g. after modifying parameters):
 ```powershell
 python visualise.py `
-  --counts bulk_counts.csv `
-  --metadata sample_meta.csv `
+  --counts data/bulk_counts.csv `
+  --metadata data/sample_meta.csv `
   --genes_in_rows `
-  --corrected corrected_logCPM.csv `
+  --corrected artifacts/outputs/corrected_logcpm.csv `
   --hvg_top 2000
 ```
 It will regenerate PCA plots and boxplots. Without `--corrected`, only "before" plots are produced.

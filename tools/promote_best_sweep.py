@@ -12,8 +12,8 @@ Examples:
       --entity <your_entity> --project nn-batch-correction \
       --sweep-id <sweep_hash> --metric objective_score --goal maximize \
       --program NN_batch_correct.py --epochs 120 --log_latent_every 0 \
-      --out_corrected promoted_corrected.csv --out_latent promoted_latent.csv \
-      --viz_pca_before promoted_pca_before.png --viz_pca_after promoted_pca_after.png --viz_pca_panel promoted_pca_panel.png
+      --out_corrected artifacts/outputs/promoted_corrected.csv --out_latent artifacts/outputs/promoted_latent.csv \
+      --viz_pca_before artifacts/outputs/promoted_pca_before.png --viz_pca_after artifacts/outputs/promoted_pca_after.png --viz_pca_panel artifacts/outputs/promoted_pca_panel.png
 
   # Promote best VAE run (cond_minus_batch) to 150 epochs with viz
   .venv/Scripts/python.exe tools/promote_best_sweep.py \

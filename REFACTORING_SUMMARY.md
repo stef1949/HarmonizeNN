@@ -158,11 +158,11 @@ python NN_batch_correct.py \
     --use_residual \
     --enc_hidden "128,128,128" \
     --dec_hidden "128,128,128" \
-    --save_model trained_model.pt
+    --save_model artifacts/checkpoints/trained_model.pt
 
 # Step 2: Apply to new data
 python predict.py \
-    --model_path trained_model.pt \
+    --model_path artifacts/checkpoints/trained_model.pt \
     --counts_path test_data.csv \
     --out_path corrected_test.csv
 ```

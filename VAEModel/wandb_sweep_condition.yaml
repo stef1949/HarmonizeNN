@@ -5,9 +5,9 @@ metric:
   goal: maximize
 parameters:
   counts:
-    value: bulk_counts.csv
+    value: data/bulk_counts.csv
   metadata:
-    value: sample_meta.csv
+    value: data/sample_meta.csv
   sample_col:
     value: sample
   batch_col:

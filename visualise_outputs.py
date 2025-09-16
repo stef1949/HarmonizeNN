@@ -22,6 +22,9 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 
+from paths import DATA_DIR, OUTPUTS_DIR, project_relative
+
+
 def library_size_normalize(counts_df: pd.DataFrame, cpm_factor: float = 1e6) -> pd.DataFrame:
     lib_sizes = counts_df.sum(axis=1).replace(0, np.nan)
     x = counts_df.div(lib_sizes, axis=0) * cpm_factor
@@ -135,23 +138,58 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Generate PCA plots before/after correction")
-    ap.add_argument('--counts', required=True, type=Path, help='Raw counts CSV (samples x genes, or use --genes_in_rows)')
-    ap.add_argument('--metadata', required=True, type=Path, help='Metadata CSV with sample, batch, and optional label cols')
+    ap.add_argument('--counts', default=None, type=Path, help='Raw counts CSV (samples x genes, or use --genes_in_rows). If omitted, defaults to data/bulk_counts.csv')
+    ap.add_argument('--metadata', default=None, type=Path, help='Metadata CSV with sample, batch, and optional label cols. If omitted, defaults to data/sample_meta.csv')
     ap.add_argument('--sample_col', default='sample', type=str)
     ap.add_argument('--batch_col', default='batch', type=str)
     ap.add_argument('--label_col', default=None, type=str)
     ap.add_argument('--genes_in_rows', action='store_true', help='Set if counts CSV has genes as rows')
-    ap.add_argument('--corrected', default=None, type=Path, help='Optional corrected matrix CSV (samples x genes)')
+    ap.add_argument('--corrected', default=None, type=Path, help='Optional corrected matrix CSV (samples x genes). Defaults to artifacts/outputs/corrected_logcpm.csv if present')
     ap.add_argument('--corrected_is_log', action='store_true', help='Set if corrected values are already log-transformed (skip log1p)')
     ap.add_argument('--viz_hvg_top', default=2000, type=int, help='Top-N genes for PCA (0=all)')
-    ap.add_argument('--viz_pca_before', default='pca_before.png', type=Path)
-    ap.add_argument('--viz_pca_after', default='pca_after.png', type=Path)
-    ap.add_argument('--viz_pca_panel', default='pca_panel.png', type=Path)
+    ap.add_argument('--viz_pca_before', default=OUTPUTS_DIR / 'pca_before.png', type=Path)
+    ap.add_argument('--viz_pca_after', default=OUTPUTS_DIR / 'pca_after.png', type=Path)
+    ap.add_argument('--viz_pca_panel', default=OUTPUTS_DIR / 'pca_panel.png', type=Path)
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.counts is None:
+        default_counts = DATA_DIR / 'bulk_counts.csv'
+        if default_counts.exists():
+            args.counts = default_counts
+            print(f"[INFO] Using default counts file: {default_counts}")
+        else:
+            raise SystemExit('ERROR: --counts not provided and data/bulk_counts.csv not found')
+    else:
+        args.counts = project_relative(args.counts)
+
+    if args.metadata is None:
+        default_meta = DATA_DIR / 'sample_meta.csv'
+        if default_meta.exists():
+            args.metadata = default_meta
+            print(f"[INFO] Using default metadata file: {default_meta}")
+        else:
+            raise SystemExit('ERROR: --metadata not provided and data/sample_meta.csv not found')
+    else:
+        args.metadata = project_relative(args.metadata)
+
+    if args.corrected is None:
+        default_corrected = OUTPUTS_DIR / 'corrected_logcpm.csv'
+        if default_corrected.exists():
+            args.corrected = default_corrected
+            print(f"[INFO] Using default corrected matrix: {default_corrected}")
+    else:
+        args.corrected = project_relative(args.corrected)
+
+    for attr in ('viz_pca_before', 'viz_pca_after', 'viz_pca_panel'):
+        value = getattr(args, attr)
+        value = project_relative(value)
+        value.parent.mkdir(parents=True, exist_ok=True)
+        setattr(args, attr, value)
+
     counts = pd.read_csv(args.counts, index_col=0)
     if args.genes_in_rows:
         counts = counts.T

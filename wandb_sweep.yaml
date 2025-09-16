@@ -25,9 +25,9 @@ command:
   - C:/Users/stef1/OneDrive/Documents/vscode/NNBatchCorrection/.venv/Scripts/python.exe
   - NN_batch_correct.py
   - --counts
-  - bulk_counts.csv
+  - data/bulk_counts.csv
   - --metadata
-  - sample_meta.csv
+  - data/sample_meta.csv
   - --genes_in_rows
   - --sample_col
   - sample
@@ -38,9 +38,9 @@ command:
   - --epochs
   - 40
   - --out_corrected
-  - corrected_logcpm.csv
+  - artifacts/outputs/corrected_logcpm.csv
   - --out_latent
-  - latent.csv
+  - artifacts/outputs/latent.csv
   - --use_wandb
   - --wandb_log
   - gradients

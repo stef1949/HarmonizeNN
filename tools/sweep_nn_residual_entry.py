@@ -13,6 +13,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from paths import OUTPUTS_DIR, project_relative
+
 
 def parse_known():
     ap = argparse.ArgumentParser(add_help=False)
@@ -26,9 +32,9 @@ def parse_known():
     ap.add_argument('--out_corrected', type=Path, required=True)
     # Optional visual settings
     ap.add_argument('--viz_hvg_top', type=int, default=2000)
-    ap.add_argument('--viz_pca_before', type=Path, default=Path('pca_before.png'))
-    ap.add_argument('--viz_pca_after', type=Path, default=Path('pca_after.png'))
-    ap.add_argument('--viz_pca_panel', type=Path, default=Path('pca_panel.png'))
+    ap.add_argument('--viz_pca_before', type=Path, default=OUTPUTS_DIR / 'pca_before.png')
+    ap.add_argument('--viz_pca_after', type=Path, default=OUTPUTS_DIR / 'pca_after.png')
+    ap.add_argument('--viz_pca_panel', type=Path, default=OUTPUTS_DIR / 'pca_panel.png')
     # Allow all other args to pass through
     args, unknown = ap.parse_known_args()
     return args, unknown
@@ -44,6 +50,17 @@ def run(cmd):
 def main():
     args, unknown = parse_known()
     py = sys.executable
+
+    args.counts = project_relative(args.counts)
+    args.metadata = project_relative(args.metadata)
+    args.out_corrected = project_relative(args.out_corrected)
+    args.out_corrected.parent.mkdir(parents=True, exist_ok=True)
+
+    for attr in ('viz_pca_before', 'viz_pca_after', 'viz_pca_panel'):
+        value = getattr(args, attr)
+        value = project_relative(value)
+        value.parent.mkdir(parents=True, exist_ok=True)
+        setattr(args, attr, value)
 
     # 1) Train with original script (forward only training args; strip viz-only flags)
     train_cmd = [

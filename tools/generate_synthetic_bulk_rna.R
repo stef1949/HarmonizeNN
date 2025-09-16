@@ -1,8 +1,8 @@
 #!/usr/bin/env Rscript
 # Synthetic bulk RNA-Seq generator for batch-correction testing
 # Outputs:
-#   - bulk_counts.csv   (genes x samples; raw counts)
-#   - sample_meta.csv   (sample,batch,condition)
+#   - data/bulk_counts.csv   (genes x samples; raw counts)
+#   - data/sample_meta.csv   (sample,batch,condition)
 #
 # Design:
 # - Negative Binomial (gene-wise mean & dispersion)
@@ -34,8 +34,10 @@ batch_lib_l2fc <- 0.20         # log2 library-size shift
 # per batch (site throughput)
 min_count_frac <- 0.00         # drop genes with
 # zero fraction > this (0 keeps all)
-out_counts     <- "bulk_counts.csv"
-out_meta       <- "sample_meta.csv"
+out_counts     <- file.path("data", "bulk_counts.csv")
+out_meta       <- file.path("data", "sample_meta.csv")
+
+dir.create('data', showWarnings = FALSE, recursive = TRUE)
 
 # -----------------------------
 # Sample design (balanced)
@@ -135,7 +137,7 @@ if (min_count_frac > 0) {
 # -----------------------------
 # Write outputs
 # -----------------------------
-# bulk_counts.csv: genes x samples
+# data/bulk_counts.csv: genes x samples
 write.csv(as.data.frame(counts), file = out_counts, row.names = TRUE)
 
 # sample_meta.csv

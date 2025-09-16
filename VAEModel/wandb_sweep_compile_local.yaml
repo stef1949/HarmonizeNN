@@ -42,9 +42,9 @@ command:
   - --seed=${seed}
 parameters:
   counts:
-    value: bulk_counts.csv   # relative to project root
+    value: data/bulk_counts.csv   # relative to project root
   metadata:
-    value: sample_meta.csv
+    value: data/sample_meta.csv
   sample_col:
     value: sample
   batch_col:

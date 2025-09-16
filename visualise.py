@@ -17,6 +17,8 @@ from matplotlib import gridspec
 import argparse
 from typing import Optional
 
+from paths import DATA_DIR, OUTPUTS_DIR, project_relative
+
 # ----------------------------
 # Define a lightweight version of the architecture config
 # ----------------------------
@@ -192,7 +194,8 @@ for i, (inp, out) in enumerate(zip(sup_dims[:-1], sup_dims[1:])):
 ax.text(0.5, 5.4, "Adversarial Autoencoder for Bulk RNA-seq Batch Correction", fontsize=14, ha='left', va='center')
 ax.text(latent.get_x()+0.6, y0+box_h+0.3, "Gradient Reversal → discourages batch info in latent", ha='center')
 
-out_path = Path("nn_architecture.png")
+out_path = OUTPUTS_DIR / "nn_architecture.png"
+out_path.parent.mkdir(parents=True, exist_ok=True)
 fig.tight_layout()
 fig.savefig(out_path, dpi=180, bbox_inches="tight")
 out_path.__str__()
@@ -312,18 +315,52 @@ def plot_boxplots(logcpm_before: pd.DataFrame, logcpm_after: Optional[pd.DataFra
 
 def main():
     ap = argparse.ArgumentParser(description='Visualise PCA and logCPM boxplots before/after correction')
-    ap.add_argument('--counts', required=True, help='Raw counts CSV (genes x samples)')
-    ap.add_argument('--metadata', required=True, help='Sample metadata CSV (sample,batch[,condition])')
-    ap.add_argument('--corrected', default=None, help='Corrected logCPM CSV (samples x genes) produced by NN_batch_correct.py')
+    ap.add_argument('--counts', default=None, type=Path, help='Raw counts CSV (genes x samples). If omitted, defaults to data/bulk_counts.csv')
+    ap.add_argument('--metadata', default=None, type=Path, help='Sample metadata CSV (sample,batch[,condition]). If omitted, defaults to data/sample_meta.csv')
+    ap.add_argument('--corrected', default=None, type=Path, help='Corrected logCPM CSV (samples x genes) produced by NN_batch_correct.py. Defaults to artifacts/outputs/corrected_logcpm.csv if present')
     ap.add_argument('--genes_in_rows', action='store_true', help='Set if counts CSV is genes in rows (default for generator)')
     ap.add_argument('--sample_col', default='sample')
     ap.add_argument('--batch_col', default='batch')
     ap.add_argument('--label_col', default='condition')
     ap.add_argument('--hvg_top', type=int, default=0, help='Top-N most variable genes to use for PCA (0 = use all)')
-    ap.add_argument('--pca_before', default='pca_before.png')
-    ap.add_argument('--pca_after', default='pca_after.png')
-    ap.add_argument('--boxplot', default='logCPM_boxplots.png')
+    ap.add_argument('--pca_before', default=OUTPUTS_DIR / 'pca_before.png', type=Path)
+    ap.add_argument('--pca_after', default=OUTPUTS_DIR / 'pca_after.png', type=Path)
+    ap.add_argument('--boxplot', default=OUTPUTS_DIR / 'logCPM_boxplots.png', type=Path)
     args = ap.parse_args()
+
+    if args.counts is None:
+        default_counts = DATA_DIR / 'bulk_counts.csv'
+        if default_counts.exists():
+            args.counts = default_counts
+            print(f"[INFO] Using default counts file: {default_counts}")
+        else:
+            raise SystemExit('ERROR: --counts not provided and data/bulk_counts.csv not found')
+    else:
+        args.counts = project_relative(args.counts)
+
+    if args.metadata is None:
+        default_meta = DATA_DIR / 'sample_meta.csv'
+        if default_meta.exists():
+            args.metadata = default_meta
+            print(f"[INFO] Using default metadata file: {default_meta}")
+        else:
+            raise SystemExit('ERROR: --metadata not provided and data/sample_meta.csv not found')
+    else:
+        args.metadata = project_relative(args.metadata)
+
+    if args.corrected is None:
+        default_corrected = OUTPUTS_DIR / 'corrected_logcpm.csv'
+        if default_corrected.exists():
+            args.corrected = default_corrected
+            print(f"[INFO] Using default corrected matrix: {default_corrected}")
+    else:
+        args.corrected = project_relative(args.corrected)
+
+    for attr in ('pca_before', 'pca_after', 'boxplot'):
+        value = getattr(args, attr)
+        value = project_relative(value)
+        value.parent.mkdir(parents=True, exist_ok=True)
+        setattr(args, attr, value)
 
     counts = pd.read_csv(args.counts, index_col=0)
     if args.genes_in_rows:
