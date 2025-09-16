@@ -24,6 +24,8 @@ License: MIT
 import argparse
 import os
 import random
+from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -83,6 +85,27 @@ def to_device(x):
     return x.cuda() if torch.cuda.is_available() else x
 
 
+def configure_torch_backend(disable_tf32: bool = False, enable_cudnn_benchmark: bool = False):
+    """Configure CUDA backend toggles for better throughput when available."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = not disable_tf32
+        torch.backends.cudnn.allow_tf32 = not disable_tf32
+    except Exception:
+        pass
+    if enable_cudnn_benchmark:
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+    elif hasattr(torch.backends, 'cudnn'):
+        try:
+            torch.backends.cudnn.benchmark = False
+        except Exception:
+            pass
+
+
 def library_size_normalize(counts_df: pd.DataFrame, cpm_factor: float = 1e6) -> pd.DataFrame:
     """Counts (samples x genes) -> CPM -> log1p."""
     lib_sizes = counts_df.sum(axis=1).replace(0, np.nan)
@@ -104,9 +127,10 @@ def standardize_per_gene_fit_transform(
     logcpm_df: pd.DataFrame, train_index: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, StandardScaler]:
     """Fit scaler on TRAIN ONLY; transform both TRAIN and VAL via indices returned."""
+    data = logcpm_df.to_numpy(dtype=np.float32, copy=True)
     scaler = StandardScaler(with_mean=True, with_std=True)
-    X_train = scaler.fit_transform(logcpm_df.values[train_index])
-    X_all = scaler.transform(logcpm_df.values)  # for later inference
+    X_train = scaler.fit_transform(data[train_index]).astype(np.float32, copy=False)
+    X_all = scaler.transform(data).astype(np.float32, copy=False)  # for later inference
     return X_train, X_all, scaler
 
 
@@ -121,9 +145,9 @@ def inverse_standardize(X: np.ndarray, scaler: StandardScaler) -> np.ndarray:
 class RNADataset(Dataset):
     def __init__(self, X: np.ndarray, batch_idx: np.ndarray,
                  label_idx: Optional[np.ndarray] = None):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.batch_idx = torch.tensor(batch_idx, dtype=torch.long)
-        self.label_idx = torch.tensor(label_idx, dtype=torch.long) if label_idx is not None else None
+        self.X = torch.as_tensor(X, dtype=torch.float32)
+        self.batch_idx = torch.as_tensor(batch_idx, dtype=torch.long)
+        self.label_idx = torch.as_tensor(label_idx, dtype=torch.long) if label_idx is not None else None
 
     def __len__(self):
         return self.X.shape[0]
@@ -148,8 +172,9 @@ def make_weighted_sampler(b_codes: np.ndarray, l_codes: Optional[np.ndarray] = N
     else:
         counts = np.bincount(b_codes, minlength=int(b_codes.max()) + 1)
         weights = 1.0 / np.clip(counts[b_codes], 1, None)
-    weights = (weights / weights.mean()).astype(np.float64)
-    return WeightedRandomSampler(weights.tolist(), num_samples=len(weights), replacement=True)
+    weights = weights / weights.mean()
+    weights = torch.as_tensor(weights, dtype=torch.float64)
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
 def _train_val_split_indices_count(n: int, val_size: int, seed: int,
                                    label_idx: Optional[np.ndarray], batch_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -274,6 +299,37 @@ def _knn_stats(Z: np.ndarray, labels: np.ndarray, k: int = 15):
     except Exception:
         return np.nan, np.nan, np.nan
 
+def _prepare_metric_subset(all_z, all_b_true, all_l_true, max_samples=None, rng=None):
+    """Concatenate latent/batch/label arrays and optionally subsample for expensive metrics.
+    Returns tuple (Z, batches, labels) or None when insufficient data."""
+    if not all_z or not all_b_true:
+        return None
+    try:
+        Z = np.concatenate(all_z)
+        B = np.concatenate(all_b_true)
+    except Exception:
+        return None
+    L = None
+    if all_l_true:
+        try:
+            L = np.concatenate(all_l_true)
+        except Exception:
+            L = None
+    if max_samples is not None and max_samples > 0 and Z.shape[0] > max_samples:
+        if rng is None:
+            rng = np.random.default_rng()
+        try:
+            idx = rng.choice(Z.shape[0], size=max_samples, replace=False)
+        except Exception:
+            idx = np.random.default_rng().choice(Z.shape[0], size=max_samples, replace=False)
+        Z = Z[idx]
+        B = B[idx]
+        if L is not None:
+            L = L[idx]
+    return Z, B, L
+
+
+
 def _eta2_by_group(Z: np.ndarray, groups: np.ndarray):
     try:
         n, d = Z.shape
@@ -345,6 +401,9 @@ def train_model(
     bio_gamma: float = 0.5,
     adaptive_cond_margin: float = 0.02,
     adaptive_cond_scale: float = 0.85,
+    metric_sample_size: int = 4096,
+    metric_sample_seed: Optional[int] = None,
+    skip_knn_metrics: bool = False,
 ) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -377,6 +436,11 @@ def train_model(
     # Use GradScaler without device_type kw (not present in some torch versions)
     scaler = GradScaler(enabled=amp_enabled)
 
+    if amp_enabled and torch.cuda.is_available():
+        autocast_ctx = partial(torch.autocast, device_type='cuda', dtype=amp_dtype)
+    else:
+        autocast_ctx = nullcontext
+
     # LR scheduler
     if scheduler_type == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5, min_lr=1e-6)
@@ -405,6 +469,13 @@ def train_model(
     # target adversary accuracy ~ random guessing
     n_batches = (len(batch_classes) if batch_classes else 2)
     target_acc = 1.0 / max(2, n_batches)
+
+    metric_rng = None
+    if metric_sample_size and metric_sample_size > 0:
+        try:
+            metric_rng = np.random.default_rng(metric_sample_seed if metric_sample_seed is not None else None)
+        except Exception:
+            metric_rng = np.random.default_rng()
 
     def lambda_at_epoch(t, last_b_acc=None):
         nonlocal adaptive_lambda
@@ -439,8 +510,8 @@ def train_model(
                 lam = max(adv_weight * 0.05, lam * adaptive_cond_scale)
         except Exception:
             pass
-        train_loss = 0.0
-        train_bio = 0.0
+        train_loss_total = torch.zeros((), device=device)
+        train_bio_total = torch.zeros((), device=device)
         opt.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(train_loader):
@@ -454,8 +525,8 @@ def train_model(
             Bb = Bb.to(device, non_blocking=True)
             Lb = Lb.to(device, non_blocking=True) if Lb is not None else None
 
-            # Only enable autocast when CUDA is available to avoid noisy warnings on CPU-only setups
-            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled and torch.cuda.is_available()):
+            # Autocast only runs when CUDA + AMP are enabled (configured above).
+            with autocast_ctx():
                 x_hat, b_logits, l_logits, z = model(Xb, adv_lambda=lam)
                 loss = recon_loss_fn(x_hat, Xb) + ce_batch(b_logits, Bb)
                 if l_logits is not None and Lb is not None:
@@ -464,7 +535,7 @@ def train_model(
                 if (Lb is not None) and (bio_weight > 0.0):
                     bio_l = bio_center_loss(z, Lb, gamma=bio_gamma)
                     loss = loss + float(bio_weight) * bio_l
-                    train_bio += float(bio_l.detach()) * Xb.size(0)
+                    train_bio_total = train_bio_total + bio_l.detach().float() * Xb.size(0)
 
             # Gradient accumulation
             effective_loss = loss / max(1, grad_accum_steps)
@@ -488,18 +559,18 @@ def train_model(
                 if scheduler_type == "cosine_warmup" and scheduler is not None:
                     scheduler.step()
 
-            train_loss += loss.item() * Xb.size(0)
+            train_loss_total = train_loss_total + loss.detach().float() * Xb.size(0)
 
-        train_loss /= len(train_loader.dataset)
-        train_bio = train_bio / max(1, len(train_loader.dataset)) if bio_weight > 0 else 0.0
+        train_loss = (train_loss_total / len(train_loader.dataset)).item()
+        train_bio = (train_bio_total / max(1, len(train_loader.dataset))).item() if bio_weight > 0 else 0.0
 
         # Validation
         model.eval()
-        val_loss = 0.0
+        val_loss_total = torch.zeros((), device=device)
         all_b_true, all_b_pred = [], []
         all_l_true, all_l_pred = [], []
         all_z = []
-        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled and torch.cuda.is_available()):
+        with torch.inference_mode():
             for batch in val_loader:
                 if len(batch) == 2:
                     Xb, Bb = batch
@@ -511,82 +582,106 @@ def train_model(
                 Bb = Bb.to(device, non_blocking=True)
                 Lb = Lb.to(device, non_blocking=True) if Lb is not None else None
 
-                x_hat, b_logits, l_logits, z = model(Xb, adv_lambda=lam)
-                loss = recon_loss_fn(x_hat, Xb) + ce_batch(b_logits, Bb)
-                if l_logits is not None and Lb is not None:
-                    loss = loss + sup_weight * ce_sup(l_logits, Lb)
-                val_loss += loss.item() * Xb.size(0)
+                with autocast_ctx():
+                    x_hat, b_logits, l_logits, z = model(Xb, adv_lambda=lam)
+                    loss = recon_loss_fn(x_hat, Xb) + ce_batch(b_logits, Bb)
+                    if l_logits is not None and Lb is not None:
+                        loss = loss + sup_weight * ce_sup(l_logits, Lb)
 
-                all_b_true.append(Bb.cpu().numpy())
-                all_b_pred.append(b_logits.argmax(dim=1).cpu().numpy())
+                val_loss_total = val_loss_total + loss.detach().float() * Xb.size(0)
+
+                all_b_true.append(Bb.detach().cpu())
+                all_b_pred.append(b_logits.argmax(dim=1).detach().cpu())
                 if l_logits is not None and Lb is not None:
-                    all_l_true.append(Lb.cpu().numpy())
-                    all_l_pred.append(l_logits.argmax(dim=1).cpu().numpy())
+                    all_l_true.append(Lb.detach().cpu())
+                    all_l_pred.append(l_logits.argmax(dim=1).detach().cpu())
                 try:
-                    all_z.append(z.cpu().numpy())
+                    all_z.append(z.detach().to(dtype=torch.float32, device='cpu'))
                 except Exception:
                     pass
-        # Compute silhouette metrics on latent space if available
-        try:
-            if len(all_z) > 0:
-                Z_all = np.concatenate(all_z)
-                b_all = np.concatenate(all_b_true)
-                batch_sil = silhouette_score(Z_all, b_all) if Z_all.shape[0] > 2 else 0.0
-                if all_l_true:
-                    l_all = np.concatenate(all_l_true)
-                    cond_sil = silhouette_score(Z_all, l_all) if len(np.unique(l_all)) > 1 else 0.0
+        # Compute latent-space metrics with optional subsampling for speed
+        z_concat = torch.cat(all_z).to(dtype=torch.float32) if all_z else None
+        b_true_full = torch.cat(all_b_true) if all_b_true else torch.tensor([], dtype=torch.long)
+        l_true_full = torch.cat(all_l_true) if all_l_true else torch.tensor([], dtype=torch.long)
+        subset = _prepare_metric_subset(
+            [z_concat.numpy()] if z_concat is not None else [],
+            [b_true_full.numpy()] if b_true_full.numel() > 0 else [],
+            [l_true_full.numpy()] if l_true_full.numel() > 0 else [],
+            max_samples=metric_sample_size,
+            rng=metric_rng,
+        )
+        if subset is not None:
+            Z_metrics, b_metrics, l_metrics = subset
+        else:
+            Z_metrics = b_metrics = l_metrics = None
+
+        batch_sil = np.nan
+        cond_sil = np.nan
+        if Z_metrics is not None:
+            try:
+                if Z_metrics.shape[0] > 2 and len(np.unique(b_metrics)) > 1:
+                    batch_sil = silhouette_score(Z_metrics, b_metrics)
+                else:
+                    batch_sil = 0.0
+                if l_metrics is not None and len(np.unique(l_metrics)) > 1:
+                    cond_sil = silhouette_score(Z_metrics, l_metrics)
                 else:
                     cond_sil = 0.0
-            else:
-                batch_sil = 0.0
-                cond_sil = 0.0
-        except Exception:
-            batch_sil = 0.0
-            cond_sil = 0.0
+            except Exception:
+                batch_sil = cond_sil = 0.0
 
-        # Additional kNN and variance-explained metrics on latent embedding
-        try:
-            if len(all_z) > 0:
-                Z_all = np.concatenate(all_z)
-                b_all = np.concatenate(all_b_true)
-                knn_batch_entropy, ilisi_batch, _ = _knn_stats(Z_all, b_all, k=15)
-                batch_eta2 = _eta2_by_group(Z_all, b_all)
-                if all_l_true and len(np.concatenate(all_l_true)) > 0:
-                    l_all = np.concatenate(all_l_true)
-                    knn_label_entropy, clisi_label, knn_label_acc = _knn_stats(Z_all, l_all, k=15)
-                    label_eta2 = _eta2_by_group(Z_all, l_all)
+        if not skip_knn_metrics and Z_metrics is not None:
+            try:
+                knn_batch_entropy, ilisi_batch, _ = _knn_stats(Z_metrics, b_metrics, k=15)
+                batch_eta2 = _eta2_by_group(Z_metrics, b_metrics)
+                if l_metrics is not None and l_metrics.size > 0:
+                    knn_label_entropy, clisi_label, knn_label_acc = _knn_stats(Z_metrics, l_metrics, k=15)
+                    label_eta2 = _eta2_by_group(Z_metrics, l_metrics)
                 else:
                     knn_label_entropy = clisi_label = knn_label_acc = label_eta2 = np.nan
-            else:
+            except Exception:
                 knn_batch_entropy = ilisi_batch = batch_eta2 = np.nan
                 knn_label_entropy = clisi_label = knn_label_acc = label_eta2 = np.nan
-        except Exception:
+        else:
             knn_batch_entropy = ilisi_batch = batch_eta2 = np.nan
             knn_label_entropy = clisi_label = knn_label_acc = label_eta2 = np.nan
 
         cond_minus_batch = (cond_sil - batch_sil) if (not np.isnan(cond_sil)) else -batch_sil
 
-        val_loss /= len(val_loader.dataset)
-        b_acc = accuracy_score(np.concatenate(all_b_true), np.concatenate(all_b_pred))
-        last_epoch_batch_acc = b_acc
+        val_loss = (val_loss_total / len(val_loader.dataset)).item()
+        try:
+            b_pred_full = torch.cat(all_b_pred) if all_b_pred else torch.tensor([], dtype=torch.long)
+        except Exception:
+            b_pred_full = torch.tensor([], dtype=torch.long)
+        if b_true_full.numel() > 0:
+            b_acc = accuracy_score(b_true_full.numpy(), b_pred_full.numpy())
+        else:
+            b_acc = np.nan
+        last_epoch_batch_acc = b_acc if not np.isnan(b_acc) else None
         if all_l_true:
-            l_acc = accuracy_score(np.concatenate(all_l_true), np.concatenate(all_l_pred))
+            try:
+                l_pred_full = torch.cat(all_l_pred) if all_l_pred else torch.tensor([], dtype=torch.long)
+                l_acc = accuracy_score(l_true_full.numpy(), l_pred_full.numpy()) if l_true_full.numel() > 0 else np.nan
+            except Exception:
+                l_acc = np.nan
         else:
             l_acc = np.nan
         # Remember cond silhouette for next epoch's lambda adjustment
         try:
-            last_epoch_cond_sil = float(cond_sil)
+            last_epoch_cond_sil = float(cond_sil) if not np.isnan(cond_sil) else None
         except Exception:
             last_epoch_cond_sil = None
 
         # Composite objective_score: maximise label accuracy, minimise val_loss, keep batch acc near target
         # target_acc defined above; penalize deviation
-        deviation = abs(b_acc - target_acc)
+        deviation = abs(b_acc - target_acc) if not np.isnan(b_acc) else target_acc
         label_component = 0.0 if np.isnan(l_acc) else l_acc
         objective_score = label_component - val_loss - deviation
         # Overcorrection penalty based on condition silhouette falling below threshold
         try:
-            cond_sil_val = float(cond_sil)  # from silhouette block if computed; else NameError
+            cond_sil_val = float(cond_sil)
+            if np.isnan(cond_sil_val):
+                cond_sil_val = 0.0
         except Exception:
             cond_sil_val = 0.0
         over_pen = max(0.0, float(cond_min) - cond_sil_val) * float(overcorr_weight)
@@ -708,7 +803,7 @@ def train_model(
             and ((epoch + 1) % log_latent_every == 0)
         ):
             try:
-                Z = np.concatenate(all_z)
+                Z = z_concat.numpy()
                 try:
                     import umap
                     reducer = umap.UMAP(n_components=2)
@@ -717,7 +812,7 @@ def train_model(
                     from sklearn.decomposition import PCA as _PCA
                     emb = _PCA(n_components=2).fit_transform(Z)
 
-                codes = np.concatenate(all_b_true)
+                codes = b_true_full.numpy()
                 fig = plt.figure(figsize=(5, 5))
                 ax = fig.add_subplot(1, 1, 1)
                 try:
@@ -994,7 +1089,7 @@ def load_inputs(
     return counts, meta
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Neural network bulk RNA-seq batch correction (adversarial autoencoder).")
     ap.add_argument("--counts", default=None, type=Path, help="Counts matrix CSV (genes x samples OR samples x genes). If omitted, will look for 'data/bulk_counts.csv'.")
     ap.add_argument("--metadata", default=None, type=Path, help="Sample metadata CSV with at least [sample,batch]. If omitted, will look for 'data/sample_meta.csv'.")
@@ -1023,6 +1118,8 @@ def main():
     ap.add_argument("--warmup_ratio", default=0.1, type=float, help="Linear warmup ratio for cosine_warmup scheduler")
     ap.add_argument("--recon_loss", default="mse", choices=["mse", "mae", "huber"], help="Reconstruction loss type")
     ap.add_argument("--amp", action="store_true", help="Enable mixed precision (AMP) training on CUDA")
+    ap.add_argument("--disable_tf32", action="store_true", help="Disable TF32 matmul/conv acceleration (enabled by default when CUDA is available).")
+    ap.add_argument("--cudnn_benchmark", action="store_true", help="Enable torch.backends.cudnn.benchmark for faster convolutions (non-deterministic).")
     ap.add_argument("--dropout", default=0.1, type=float, help="Dropout probability for all MLPs")
     ap.add_argument("--use_residual", action="store_true", help="Use residual connections in autoencoder networks (requires uniform hidden layer sizes)")
     ap.add_argument("--grad_accum", default=1, type=int, help="Gradient accumulation steps")
@@ -1046,6 +1143,9 @@ def main():
     ap.add_argument("--cond_min", default=0.10, type=float, help="Minimum acceptable condition separation (silhouette) before penalising overcorrection.")
     ap.add_argument("--overcorr_weight", default=0.5, type=float, help="Penalty weight applied when condition silhouette < cond_min.")
     ap.add_argument("--log_latent_every", default=1, type=int, help="Log latent embedding plot every N epochs (0=disable).")
+    ap.add_argument("--metric_sample_size", default=4096, type=int, help="Max latent vectors to use when computing validation metrics (0=use all).")
+    ap.add_argument("--metric_seed", default=None, type=int, help="Optional random seed for latent metric subsampling.")
+    ap.add_argument("--skip_knn_metrics", action="store_true", help="Skip kNN/LISI latent metrics during validation to reduce overhead.")
     # New model variants / VAE+Attention
     ap.add_argument("--model_type", default="ae", choices=["ae", "vae_attention"], help="Base model: adversarial AE or VAE with attention.")
     ap.add_argument("--vae_hidden_dim", default=256, type=int, help="Hidden dim for VAE attention encoder/decoder.")
@@ -1069,7 +1169,7 @@ def main():
     ap.add_argument("--bio_gamma", default=0.5, type=float, help="Relative weight for between-class separation in center loss")
     ap.add_argument("--adaptive_cond_margin", default=0.02, type=float, help="If cond silhouette < cond_min + margin, reduce adversarial strength")
     ap.add_argument("--adaptive_cond_scale", default=0.85, type=float, help="Multiplicative scale on adversarial lambda when condition separation is weak")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     # -------- Fallbacks for omitted required-style arguments --------
     if args.counts is None:
@@ -1143,6 +1243,8 @@ def main():
 
 
     set_seed(args.seed)
+
+    configure_torch_backend(disable_tf32=args.disable_tf32, enable_cudnn_benchmark=args.cudnn_benchmark)
 
     # Optionally initialize Weights & Biases
     wandb_run = None
@@ -1365,13 +1467,16 @@ def main():
             bio_gamma=args.bio_gamma,
             adaptive_cond_margin=args.adaptive_cond_margin,
             adaptive_cond_scale=args.adaptive_cond_scale,
+            metric_sample_size=args.metric_sample_size,
+            metric_sample_seed=args.metric_seed,
+            skip_knn_metrics=args.skip_knn_metrics,
         )
         model = fit["model"]
 
     # Inference: corrected = decoder(encoder(X)) using TRAIN-fitted scaler
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         X_all = torch.tensor(X_all_input, dtype=torch.float32, device=device)
         if args.model_type == "vae_attention":
             # Need batch indices for reconstruction; reuse encoded full batch order

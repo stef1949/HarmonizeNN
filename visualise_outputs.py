@@ -136,7 +136,7 @@ def _pca_panel(before_df: pd.DataFrame, after_df: pd.DataFrame, meta: pd.DataFra
     print(f"[OK] Saved PCA panel: {out_path}")
 
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Generate PCA plots before/after correction")
     ap.add_argument('--counts', default=None, type=Path, help='Raw counts CSV (samples x genes, or use --genes_in_rows). If omitted, defaults to data/bulk_counts.csv')
     ap.add_argument('--metadata', default=None, type=Path, help='Metadata CSV with sample, batch, and optional label cols. If omitted, defaults to data/sample_meta.csv')
@@ -150,11 +150,11 @@ def parse_args():
     ap.add_argument('--viz_pca_before', default=OUTPUTS_DIR / 'pca_before.png', type=Path)
     ap.add_argument('--viz_pca_after', default=OUTPUTS_DIR / 'pca_after.png', type=Path)
     ap.add_argument('--viz_pca_panel', default=OUTPUTS_DIR / 'pca_panel.png', type=Path)
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
     if args.counts is None:
         default_counts = DATA_DIR / 'bulk_counts.csv'

@@ -2,25 +2,25 @@
 """
 Sweep entrypoint for residual AE: runs NN_batch_correct.py then generates PCA plots.
 
-This wrapper preserves all original CLI args to the training script and then
-invokes visualise_outputs.py to create PCA plots using the provided counts,
-metadata and the produced corrected matrix.
+Reuses the same Python process to avoid costly interpreter start-up between sweep
+runs. All non-visual arguments are forwarded verbatim to the training CLI.
 """
 import argparse
-import os
 import shlex
-import subprocess
 import sys
 from pathlib import Path
+from typing import Callable, List, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from paths import OUTPUTS_DIR, project_relative
+from NN_batch_correct import main as train_main
+from visualise_outputs import main as viz_main
 
 
-def parse_known():
+def parse_known() -> Tuple[argparse.Namespace, List[str]]:
     ap = argparse.ArgumentParser(add_help=False)
     # We only explicitly read the fields needed for visualisation; everything else is forwarded verbatim
     ap.add_argument('--counts', type=Path, required=True)
@@ -40,16 +40,19 @@ def parse_known():
     return args, unknown
 
 
-def run(cmd):
+def call_cli(fn: Callable[[Optional[Sequence[str]]], None], argv: Sequence[str], label: str) -> None:
+    cmd = f"{label} {shlex.join(argv)}"
     print(f"[RUN] {cmd}")
-    proc = subprocess.run(cmd, shell=False)
-    if proc.returncode != 0:
-        raise SystemExit(proc.returncode)
+    try:
+        fn(list(argv))
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 0
+        if code != 0:
+            raise SystemExit(code) from exc
 
 
-def main():
+def main() -> None:
     args, unknown = parse_known()
-    py = sys.executable
 
     args.counts = project_relative(args.counts)
     args.metadata = project_relative(args.metadata)
@@ -63,8 +66,7 @@ def main():
         setattr(args, attr, value)
 
     # 1) Train with original script (forward only training args; strip viz-only flags)
-    train_cmd = [
-        py, 'NN_batch_correct.py',
+    train_args: List[str] = [
         '--counts', str(args.counts),
         '--metadata', str(args.metadata),
         '--out_corrected', str(args.out_corrected),
@@ -72,16 +74,19 @@ def main():
         '--batch_col', args.batch_col,
     ]
     if args.label_col:
-        train_cmd += ['--label_col', args.label_col]
+        train_args += ['--label_col', args.label_col]
     if args.genes_in_rows:
-        train_cmd += ['--genes_in_rows']
-    # Append the remaining (unknown) args untouched (e.g., --use_residual, --epochs, etc.)
-    train_cmd += unknown
-    run(train_cmd)
+        train_args += ['--genes_in_rows']
 
-    # 2) Visualise PCA (corrected is log-like for AE path)
-    viz_cmd = [
-        py, 'visualise_outputs.py',
+    extra_args = list(unknown)
+    train_args.extend(extra_args)
+    call_cli(train_main, train_args, 'NN_batch_correct')
+
+    should_run_viz = '--generate_viz' not in extra_args
+    if not should_run_viz:
+        return
+
+    viz_args: List[str] = [
         '--counts', str(args.counts),
         '--metadata', str(args.metadata),
         '--sample_col', args.sample_col,
@@ -91,14 +96,14 @@ def main():
         '--viz_pca_after', str(args.viz_pca_after),
         '--viz_pca_panel', str(args.viz_pca_panel),
         '--corrected', str(args.out_corrected),
-        '--corrected_is_log'
+        '--corrected_is_log',
     ]
     if args.label_col:
-        viz_cmd.extend(['--label_col', args.label_col])
+        viz_args += ['--label_col', args.label_col]
     if args.genes_in_rows:
-        viz_cmd.append('--genes_in_rows')
+        viz_args.append('--genes_in_rows')
 
-    run(viz_cmd)
+    call_cli(viz_main, viz_args, 'visualise_outputs')
 
 
 if __name__ == '__main__':

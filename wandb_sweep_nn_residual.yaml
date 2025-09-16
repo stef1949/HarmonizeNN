@@ -46,7 +46,7 @@ command:
   - --early_stop_metric
   - objective_overcorr
   - --log_latent_every
-  - 0
+  - 5
   - --patience
   - 25
   - --min_epochs
@@ -58,6 +58,7 @@ command:
   - --generate_viz
   - --amp
   - --pin_memory
+  - --skip_knn_metrics
   # wrapper will generate visualisations after training
   - ${args}
 
