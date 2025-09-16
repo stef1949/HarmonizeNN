@@ -333,6 +333,7 @@ def train_model(
     log_latent_every: int = 1,  # 0 disables
     min_epochs: int = 0,
     early_stop_delta: float = 0.0,
+    stop_on_negative: bool = False,
     wandb_run: Optional[object] = None,
     batch_classes: Optional[list] = None,
     label_classes: Optional[list] = None,
@@ -662,6 +663,17 @@ def train_model(
         }[early_stop_metric_use]
 
         maximize = early_stop_metric_use in ("val_batch_acc", "val_sup_acc", "objective_score", "objective_overcorr")
+
+        # Optional: terminate immediately if monitored metric becomes negative
+        if stop_on_negative and isinstance(current_metric_value, (int, float)):
+            try:
+                if current_metric_value < 0:
+                    print(
+                        f"Early stopping at epoch {epoch+1} ({early_stop_metric_use} negative: {current_metric_value:.5f})."
+                    )
+                    break
+            except Exception:
+                pass
         # Initialize best_val after first metric computed
         if best_val is None:
             best_val = current_metric_value
@@ -1017,6 +1029,7 @@ def main():
     ap.add_argument("--patience", default=20, type=int)
     ap.add_argument("--min_epochs", default=0, type=int, help="Do not trigger early stopping before this many epochs (0=disable)")
     ap.add_argument("--early_stop_delta", default=0.0, type=float, help="Minimum improvement required to reset patience (direction depends on metric)")
+    ap.add_argument("--stop_on_negative", action="store_true", help="Terminate early when the monitored early_stop_metric becomes negative.")
     ap.add_argument("--seed", default=42, type=int)
     ap.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2+) for speed")
     ap.add_argument("--out_corrected", default=None, type=Path, help="Output CSV path for corrected matrix (logCPM scale). Defaults to 'corrected_logcpm.csv' if omitted.")
@@ -1073,6 +1086,29 @@ def main():
     if args.out_corrected is None:
         args.out_corrected = Path("corrected_logcpm.csv")
         print(f"[INFO] Using default output path: {args.out_corrected}")
+
+    # Early validation to avoid deep pandas traceback
+    try:
+        counts_path = Path(args.counts)
+    except Exception:
+        counts_path = Path(str(args.counts))
+    if not counts_path.exists():
+        nearby = ", ".join(str(p) for p in sorted(Path(".").glob("*.csv")))
+        msg = f"ERROR: counts CSV not found at '{args.counts}'. Update --counts to a valid path or place the file here."
+        if nearby:
+            msg += f" Nearby CSVs in cwd: {nearby}"
+        raise SystemExit(msg)
+
+    try:
+        meta_path = Path(args.metadata)
+    except Exception:
+        meta_path = Path(str(args.metadata))
+    if not meta_path.exists():
+        nearby = ", ".join(str(p) for p in sorted(Path(".").glob("*.csv")))
+        msg = f"ERROR: metadata CSV not found at '{args.metadata}'. Update --metadata to a valid path or place the file here."
+        if nearby:
+            msg += f" Nearby CSVs in cwd: {nearby}"
+        raise SystemExit(msg)
 
 
     set_seed(args.seed)
@@ -1288,6 +1324,7 @@ def main():
             log_latent_every=args.log_latent_every,
             min_epochs=args.min_epochs,
             early_stop_delta=args.early_stop_delta,
+            stop_on_negative=args.stop_on_negative,
             wandb_run=wandb_run,
             batch_classes=batch_classes,
             label_classes=label_classes,

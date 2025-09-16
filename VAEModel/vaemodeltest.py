@@ -656,24 +656,63 @@ def _train_val_split_indices(n: int, test_size: float, seed: int,
     va, tr = idx[:val_size], idx[val_size:]
     return tr, va
 def load_inputs(counts_path, meta_path, sample_col, batch_col, label_col, genes_in_rows):
-    """Loads, validates, and aligns counts and metadata."""
+    """Loads, validates, and aligns counts and metadata with light robustness.
+
+    - Respects --genes_in_rows when provided
+    - Auto-detects orientation if overlap is too small
+    - Trims whitespace on indices before failing
+    """
+    # Read counts (index is either samples or genes depending on file layout)
     counts = pd.read_csv(counts_path, index_col=0)
+
+    # If user explicitly declares genes are rows, transpose to samples x genes
     if genes_in_rows:
         counts = counts.T
-    
+
+    # Read metadata and set index to sample column
     meta = pd.read_csv(meta_path)
     if sample_col not in meta.columns:
         raise ValueError(f"Sample column '{sample_col}' not found in metadata.")
+    if batch_col not in meta.columns:
+        raise ValueError(f"Batch column '{batch_col}' not found in metadata.")
+    if label_col is not None and label_col not in meta.columns:
+        # Don't hard fail training if label not provided by user
+        raise ValueError(f"Label column '{label_col}' not found in metadata.")
     meta = meta.set_index(sample_col)
 
-    # Find common samples between the two files
+    # Straightforward intersection first
     common_samples = counts.index.intersection(meta.index)
-    
+
+    # Try auto-detect orientation if too few overlaps
     if len(common_samples) < 2:
-        raise ValueError("Found fewer than 2 overlapping samples in counts and metadata files.")
-    
+        cols_common = counts.columns.intersection(meta.index)
+        if len(cols_common) >= 2:
+            print("[INFO] Detected sample IDs in counts columns - transposing counts to samples x genes.")
+            counts = counts.T
+            common_samples = counts.index.intersection(meta.index)
+
+    # Normalize whitespace if still low overlap
+    if len(common_samples) < 2:
+        try:
+            counts.index = counts.index.astype(str).str.strip()
+            counts.columns = counts.columns.astype(str).str.strip()
+            meta.index = meta.index.astype(str).str.strip()
+            common_samples = counts.index.intersection(meta.index)
+        except Exception:
+            pass
+
+    if len(common_samples) < 2:
+        # Provide a short debug hint before failing
+        ex_counts = list(map(str, list(counts.index[:3])))
+        ex_meta = list(map(str, list(meta.index[:3])))
+        raise ValueError(
+            "Too few overlapping samples between counts and metadata. "
+            f"First counts idx examples: {ex_counts}; first meta idx examples: {ex_meta}. "
+            "Check --genes_in_rows and sample ID formatting."
+        )
+
     # Return the aligned dataframes
-    return counts.loc[common_samples], meta.loc[common_samples]
+    return counts.loc[common_samples].copy(), meta.loc[common_samples].copy()
 
 # ----------------------------
 # Visualisation Helpers

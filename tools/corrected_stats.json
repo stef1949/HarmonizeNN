@@ -1,0 +1,10 @@
+{
+  "batch_silhouette": -0.021794901097426815,
+  "label_silhouette": 0.9501216053609728,
+  "knn_label_entropy": -1.4428232973175173e-12,
+  "knn_label_acc": 1.0,
+  "label_eta2": 0.03305550281616249,
+  "knn_batch_entropy": 0.6584245655086782,
+  "ilisi_batch": 2.231020672858286,
+  "batch_eta2": 0.07963349248731598
+}
