@@ -112,7 +112,9 @@ def library_size_normalize(counts_df: pd.DataFrame, cpm_factor: float = 1e6) -> 
     """
 
     lib_sizes = counts_df.sum(axis=1)
-    zero_mask = lib_sizes <= 0
+    if (lib_sizes < 0).any():
+        raise ValueError("Negative library sizes detected. This may indicate data corruption.")
+    zero_mask = lib_sizes == 0
     lib_sizes = lib_sizes.mask(zero_mask, 1.0)
 
     x = counts_df.div(lib_sizes, axis=0) * cpm_factor
