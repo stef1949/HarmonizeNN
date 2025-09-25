@@ -29,8 +29,6 @@ from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple
 
-import random
-import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -107,10 +105,25 @@ def configure_torch_backend(disable_tf32: bool = False, enable_cudnn_benchmark: 
 
 
 def library_size_normalize(counts_df: pd.DataFrame, cpm_factor: float = 1e6) -> pd.DataFrame:
-    """Counts (samples x genes) -> CPM -> log1p."""
-    lib_sizes = counts_df.sum(axis=1).replace(0, np.nan)
+    """Counts (samples x genes) -> CPM -> log1p.
+
+    Any samples with zero library size would previously yield NaNs after division;
+    we instead treat those rows as having zero expression across all genes.
+    """
+
+    lib_sizes = counts_df.sum(axis=1)
+    if (lib_sizes < 0).any():
+        raise ValueError("Negative library sizes detected. This may indicate data corruption.")
+    zero_mask = lib_sizes == 0
+    lib_sizes = lib_sizes.mask(zero_mask, 1.0)
+
     x = counts_df.div(lib_sizes, axis=0) * cpm_factor
     x = np.log1p(x)
+
+    if zero_mask.any():
+        # Zero-count samples should remain zero after log1p(CPM)
+        x.loc[zero_mask] = 0.0
+
     return x
 
 
