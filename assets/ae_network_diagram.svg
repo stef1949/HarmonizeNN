@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 600" role="img" aria-labelledby="title desc">
+  <title id="title">HarmonizeNN Adversarial Autoencoder</title>
+  <desc id="desc">Forward path from input counts through encoder, latent representation, decoder, and outputs with gradient reversal adversary and optional supervised head with weighted losses.</desc>
+  <style>
+    text { font-family: 'Segoe UI', Helvetica, Arial, sans-serif; fill: #0f172a; font-size: 18px; }
+    .title { font-size: 30px; font-weight: 600; }
+    .subtitle { font-size: 20px; font-weight: 500; fill: #334155; }
+    rect.stage { rx: 14; ry: 14; fill: #e0f2fe; stroke: #0284c7; stroke-width: 2; }
+    rect.latent { rx: 14; ry: 14; fill: #dcfce7; stroke: #16a34a; stroke-width: 2; }
+    rect.output { rx: 14; ry: 14; fill: #f8fafc; stroke: #0f172a; stroke-width: 2; }
+    rect.adv { rx: 14; ry: 14; fill: #fee2e2; stroke: #ef4444; stroke-width: 2; }
+    rect.sup { rx: 14; ry: 14; fill: #ede9fe; stroke: #7c3aed; stroke-width: 2; }
+    rect.loss { rx: 12; ry: 12; fill: #f8fafc; stroke: #1e293b; stroke-width: 2; }
+    line, path { stroke: #1e293b; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    .grl { stroke-dasharray: 10 6; stroke: #ef4444; marker-end: url(#arrow-red); }
+    .optional { stroke-dasharray: 6 6; stroke: #7c3aed; marker-end: url(#arrow-purple); }
+    .back { stroke-dasharray: 6 6; stroke: #475569; marker-end: url(#arrow); }
+    .note { font-size: 16px; fill: #475569; }
+    .legend { font-size: 14px; fill: #475569; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="strokeWidth" orient="auto" markerWidth="10" markerHeight="10">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1e293b" />
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="strokeWidth" orient="auto" markerWidth="10" markerHeight="10">
+      <path d="M0,0 L10,5 L0,10 z" fill="#ef4444" />
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="strokeWidth" orient="auto" markerWidth="10" markerHeight="10">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed" />
+    </marker>
+  </defs>
+
+  <text class="title" x="520" y="56" text-anchor="middle">HarmonizeNN – Adversarial Autoencoder</text>
+  <text class="subtitle" x="520" y="90" text-anchor="middle">Latent batch correction with gradient reversal and optional supervision</text>
+
+  <!-- Forward pathway -->
+  <rect class="output" x="70" y="150" width="170" height="110" />
+  <text x="155" y="190" text-anchor="middle">Input logCPM</text>
+  <text x="155" y="220" text-anchor="middle" class="note">genes × samples</text>
+
+  <rect class="stage" x="280" y="136" width="150" height="138" />
+  <text x="355" y="182" text-anchor="middle">Encoder MLP</text>
+  <text x="355" y="208" text-anchor="middle" class="note">Linear → LayerNorm</text>
+  <text x="355" y="232" text-anchor="middle" class="note">SiLU + Dropout</text>
+
+  <rect class="latent" x="470" y="156" width="120" height="98" />
+  <text x="530" y="194" text-anchor="middle">Latent z</text>
+  <text x="530" y="220" text-anchor="middle" class="note">dim = latent_dim</text>
+  <text x="530" y="244" text-anchor="middle" class="note">Supports residual MLP blocks</text>
+
+  <rect class="stage" x="630" y="136" width="140" height="138" />
+  <text x="700" y="182" text-anchor="middle">Decoder MLP</text>
+  <text x="700" y="208" text-anchor="middle" class="note">Mirrors encoder</text>
+  <text x="700" y="232" text-anchor="middle" class="note">Reconstruct x̂</text>
+
+  <rect class="output" x="820" y="150" width="170" height="110" />
+  <text x="905" y="190" text-anchor="middle">Reconstruction</text>
+  <text x="905" y="220" text-anchor="middle" class="note">Batch-corrected logCPM</text>
+
+  <line x1="240" y1="205" x2="280" y2="205" />
+  <line x1="430" y1="205" x2="470" y2="205" />
+  <line x1="590" y1="205" x2="630" y2="205" />
+  <line x1="770" y1="205" x2="820" y2="205" />
+
+  <!-- Gradient reversal adversary -->
+  <rect class="adv" x="440" y="340" width="180" height="130" />
+  <text x="530" y="378" text-anchor="middle">Batch adversary</text>
+  <text x="530" y="404" text-anchor="middle" class="note">MLP → batch logits</text>
+  <text x="530" y="428" text-anchor="middle" class="note">Gradient reversal λ(t)</text>
+
+  <path class="grl" d="M530 255 C530 280, 530 300, 530 340" />
+  <text x="552" y="300" class="note">GRL flips gradients</text>
+
+  <!-- Optional supervised head -->
+  <rect class="sup" x="780" y="340" width="180" height="130" />
+  <text x="870" y="374" text-anchor="middle">Optional label head</text>
+  <text x="870" y="400" text-anchor="middle" class="note">MLP → label logits</text>
+  <text x="870" y="424" text-anchor="middle" class="note">Enabled when labels supplied</text>
+
+  <path class="optional" d="M590 255 C690 285, 770 300, 870 340" />
+  <text x="760" y="304" class="note">Supervision (optional)</text>
+
+  <!-- Loss panel -->
+  <rect class="loss" x="100" y="360" width="260" height="150" />
+  <text x="230" y="396" text-anchor="middle">Training objectives</text>
+  <text x="230" y="422" text-anchor="middle" class="note">Reconstruction: MSE | MAE | Huber</text>
+  <text x="230" y="446" text-anchor="middle" class="note">Adversarial: batch CE × adv_weight</text>
+  <text x="230" y="470" text-anchor="middle" class="note">Supervised: optional CE × sup_weight</text>
+
+  <line class="back" x1="360" y1="430" x2="440" y2="430" />
+  <text x="400" y="412" text-anchor="middle" class="note">Backprop through encoder</text>
+
+  <!-- Legend -->
+  <rect class="loss" x="60" y="520" width="300" height="56" />
+  <line x1="80" y1="546" x2="130" y2="546" />
+  <text x="150" y="550" class="legend">Forward activations</text>
+  <path class="grl" d="M210 546 H260" />
+  <text x="280" y="550" class="legend">Gradient reversal signal</text>
+  <path class="optional" d="M80 566 H130" />
+  <text x="150" y="570" class="legend">Optional supervision path</text>
+  <line class="back" x1="210" y1="566" x2="260" y2="566" />
+  <text x="280" y="570" class="legend">Loss backprop</text>
+</svg>
