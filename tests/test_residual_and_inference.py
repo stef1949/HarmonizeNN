@@ -16,9 +16,9 @@ class TestResidualBlock:
         hidden_size = 128
         batch_size = 16
         
-        block = ResidualBlock(hidden_size, dropout=0.1)
+        block = ResidualBlock(hidden_size, hidden_size, dropout=0.1)
         x = torch.randn(batch_size, hidden_size)
-        
+
         output = block(x)
         
         # Output should have same shape as input
@@ -29,11 +29,18 @@ class TestResidualBlock:
     
     def test_residual_block_dimensions(self):
         """Test ResidualBlock with various dimensions."""
-        for hidden_size in [64, 128, 256]:
-            block = ResidualBlock(hidden_size, dropout=0.0)
-            x = torch.randn(10, hidden_size)
+        for in_dim, out_dim in [(64, 64), (64, 128), (128, 32)]:
+            block = ResidualBlock(in_dim, out_dim, dropout=0.0)
+            x = torch.randn(10, in_dim)
             output = block(x)
-            assert output.shape == (10, hidden_size)
+            assert output.shape == (10, out_dim)
+
+    def test_residual_block_projection_learns(self):
+        """Projection branch should learn non-trivial mappings when dims change."""
+        block = ResidualBlock(32, 64, dropout=0.0)
+        x = torch.randn(4, 32)
+        out = block(x)
+        assert out.shape == (4, 64)
 
 
 class TestMakeMLP:
@@ -47,24 +54,16 @@ class TestMakeMLP:
         
         assert output.shape == (8, 10)
     
-    def test_make_mlp_with_residual_uniform_hidden(self):
-        """Test make_mlp with residual connections and uniform hidden sizes."""
-        # All hidden layers must be the same size for residual connections
-        sizes = [100, 64, 64, 64, 10]  # input, hidden1, hidden2, hidden3, output
+    def test_make_mlp_with_residual_handles_dim_changes(self):
+        """Residual builder should accept non-uniform hidden sizes via projections."""
+        sizes = [100, 128, 64, 32, 10]
         mlp = make_mlp(sizes, dropout=0.1, use_residual=True)
-        
+
         x = torch.randn(8, 100)
         output = mlp(x)
-        
+
         assert output.shape == (8, 10)
-    
-    def test_make_mlp_with_residual_non_uniform_hidden_raises_error(self):
-        """Test that non-uniform hidden sizes raise ValueError with residual=True."""
-        sizes = [100, 64, 32, 16, 10]  # Non-uniform hidden sizes
-        
-        with pytest.raises(ValueError, match="all hidden layer sizes must be the same"):
-            make_mlp(sizes, dropout=0.1, use_residual=True)
-    
+
     def test_make_mlp_residual_minimum_layers(self):
         """Test that residual networks need at least 3 layers."""
         sizes = [100, 10]  # Only input and output
@@ -110,14 +109,14 @@ class TestAEBatchCorrector:
         model = AEBatchCorrector(
             n_genes=1000,
             latent_dim=32,
-            enc_hidden=(128, 128, 128),  # Uniform hidden sizes
-            dec_hidden=(128, 128, 128),  # Uniform hidden sizes
+            enc_hidden=(128, 128, 128),
+            dec_hidden=(128, 128, 128),
             n_batches=3,
             n_labels=2,
             dropout=0.1,
             use_residual=True,
         )
-        
+
         x = torch.randn(16, 1000)
         x_hat, b_logits, l_logits, z = model(x, adv_lambda=1.0)
         
@@ -126,17 +125,22 @@ class TestAEBatchCorrector:
         assert l_logits.shape == (16, 2)
         assert z.shape == (16, 32)
     
-    def test_ae_with_residual_non_uniform_hidden_raises_error(self):
-        """Test that non-uniform hidden sizes raise error with residual=True."""
-        with pytest.raises(ValueError, match="all hidden layer sizes must be the same"):
-            model = AEBatchCorrector(
-                n_genes=1000,
-                latent_dim=32,
-                enc_hidden=(256, 128),  # Non-uniform
-                dec_hidden=(128, 256),  # Non-uniform
-                n_batches=3,
-                use_residual=True,
-            )
+    def test_ae_with_residual_non_uniform_hidden(self):
+        """Non-uniform hidden sizes should be supported via projection skips."""
+        model = AEBatchCorrector(
+            n_genes=1000,
+            latent_dim=32,
+            enc_hidden=(256, 128),
+            dec_hidden=(128, 256),
+            n_batches=3,
+            use_residual=True,
+        )
+
+        x = torch.randn(8, 1000)
+        x_hat, b_logits, l_logits, z = model(x, adv_lambda=1.0)
+        assert x_hat.shape == (8, 1000)
+        assert b_logits.shape == (8, 3)
+        assert z.shape == (8, 32)
     
     def test_ae_reconstruct_method(self):
         """Test the reconstruct method for inference."""
