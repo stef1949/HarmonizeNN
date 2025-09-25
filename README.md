@@ -15,6 +15,15 @@
 An adversarial autoencoder for bulk RNA-seq batch effect correction. It learns a latent representation that preserves biological signal (optional supervised head) while discouraging batch-specific variation via a gradient reversal adversary. Outputs a batch-corrected expression matrix (logCPM scale) and optional latent embedding plus visual diagnostics.
 
 ---
+## Model Architecture
+
+<p align="center">
+  <img src="assets/ae_network_diagram.svg" alt="HarmonizeNN adversarial autoencoder architecture" width="860" />
+</p>
+
+The encoder and decoder are multi-layer perceptrons with LayerNorm, SiLU activations, and dropout. A gradient reversal layer feeds the latent code to the batch adversary to discourage batch-specific signal, while an optional supervised head maintains biological labels when provided.
+
+---
 ## Key Features
 - Counts → library-size normalisation → CPM → log1p
 - Optional highly-variable gene (HVG) selection
