@@ -7,6 +7,8 @@ improve modularity and reuse without changing public behavior.
 """
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 import torch.nn as nn
 
@@ -44,27 +46,96 @@ class GradReverseLayer(nn.Module):
 # ----------------------------
 
 
+def _make_activation(name: str | None) -> nn.Module | None:
+    if name is None:
+        return None
+    name = name.lower()
+    if name == "relu":
+        return nn.ReLU()
+    if name == "tanh":
+        return nn.Tanh()
+    if name == "sigmoid":
+        return nn.Sigmoid()
+    if name in {"silu", "swish"}:
+        return nn.SiLU()
+    if name == "gelu":
+        return nn.GELU()
+    raise ValueError(f"Unsupported activation: {name}")
+
+
 class ResidualBlock(nn.Module):
-    """
-    Residual block with skip connection: x + FFN(x) + LayerNorm
-    """
+    """Feed-forward residual block with optional projection skip."""
 
-    def __init__(self, hidden_size: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        hidden_features: int | None = None,
+        dropout: float = 0.0,
+        activation: str = "silu",
+        use_layer_norm: bool = True,
+    ) -> None:
         super().__init__()
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Dropout(dropout),
-        )
-        self.layer_norm = nn.LayerNorm(hidden_size)
+        hidden_features = out_features if hidden_features is None else hidden_features
 
-    def forward(self, x):
-        return self.layer_norm(x + self.ffn(x))
+        ff_layers: list[nn.Module] = [nn.Linear(in_features, hidden_features)]
+        act = _make_activation(activation)
+        if act is not None:
+            ff_layers.append(act)
+        if dropout > 0:
+            ff_layers.append(nn.Dropout(dropout))
+        ff_layers.append(nn.Linear(hidden_features, out_features))
+        if dropout > 0:
+            ff_layers.append(nn.Dropout(dropout))
+        self.ffn = nn.Sequential(*ff_layers)
+
+        if in_features == out_features:
+            self.shortcut: nn.Module = nn.Identity()
+        else:
+            self.shortcut = nn.Linear(in_features, out_features, bias=False)
+
+        self.layer_norm = nn.LayerNorm(out_features) if use_layer_norm else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layer_norm(self.shortcut(x) + self.ffn(x))
 
 
-def make_mlp(sizes, dropout=0.0, last_activation=None, use_residual=False):
+class ResidualStack(nn.Module):
+    """Stack of residual blocks that can change feature dimensionality."""
+
+    def __init__(
+        self,
+        sizes: Sequence[int],
+        *,
+        dropout: float = 0.0,
+        activation: str = "silu",
+    ) -> None:
+        super().__init__()
+        if len(sizes) < 2:
+            raise ValueError("ResidualStack requires at least two layer sizes")
+
+        blocks = [
+            ResidualBlock(
+                in_features=in_f,
+                out_features=out_f,
+                dropout=dropout,
+                activation=activation,
+            )
+            for in_f, out_f in zip(sizes[:-1], sizes[1:])
+        ]
+        self.blocks = nn.Sequential(*blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.blocks(x)
+
+
+def make_mlp(
+    sizes: Sequence[int],
+    dropout: float = 0.0,
+    last_activation: str | None = None,
+    use_residual: bool = False,
+):
     """
     Hidden layers: Linear -> LayerNorm -> SiLU -> Dropout
     Output layer: optional activation per arg
@@ -78,52 +149,34 @@ def make_mlp(sizes, dropout=0.0, last_activation=None, use_residual=False):
                 "Residual networks need at least input, hidden, and output layers"
             )
 
-        # Check that all hidden layers have the same size for residual connections
-        hidden_sizes = sizes[1:-1]
-        if len(set(hidden_sizes)) > 1:
-            raise ValueError(
-                f"For residual connections, all hidden layer sizes must be the same. Got: {hidden_sizes}"
-            )
-
-        hidden_size = hidden_sizes[0]
-        num_hidden_layers = len(hidden_sizes)
-
-        layers = []
-
-        # Input projection to hidden size
-        layers.append(nn.Linear(sizes[0], hidden_size))
-        layers.extend([nn.LayerNorm(hidden_size), nn.SiLU(), nn.Dropout(dropout)])
-
-        # Residual blocks
-        for _ in range(num_hidden_layers):
-            layers.append(ResidualBlock(hidden_size, dropout))
-
-        # Output layer
-        layers.append(nn.Linear(hidden_size, sizes[-1]))
-        if last_activation == "relu":
-            layers.append(nn.ReLU())
-        elif last_activation == "tanh":
-            layers.append(nn.Tanh())
-        elif last_activation == "sigmoid":
-            layers.append(nn.Sigmoid())
-
+        trunk_sizes = sizes[:-1]
+        layers: list[nn.Module] = [
+            ResidualStack(trunk_sizes, dropout=dropout, activation="silu")
+        ]
+        layers.append(nn.Linear(trunk_sizes[-1], sizes[-1]))
+        final_act = _make_activation(last_activation)
+        if final_act is not None:
+            layers.append(final_act)
         return nn.Sequential(*layers)
 
     else:
         # Original implementation
-        layers = []
+        layers: list[nn.Module] = []
         for i in range(len(sizes) - 1):
             in_f, out_f = sizes[i], sizes[i + 1]
             layers.append(nn.Linear(in_f, out_f))
-            if i < len(sizes) - 2:
-                layers += [nn.LayerNorm(out_f), nn.SiLU(), nn.Dropout(dropout)]
+            is_last = i == len(sizes) - 2
+            if not is_last:
+                layers.append(nn.LayerNorm(out_f))
+                act = _make_activation("silu")
+                if act is not None:
+                    layers.append(act)
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
             else:
-                if last_activation == "relu":
-                    layers += [nn.ReLU()]
-                elif last_activation == "tanh":
-                    layers += [nn.Tanh()]
-                elif last_activation == "sigmoid":
-                    layers += [nn.Sigmoid()]
+                final_act = _make_activation(last_activation)
+                if final_act is not None:
+                    layers.append(final_act)
         return nn.Sequential(*layers)
 
 
