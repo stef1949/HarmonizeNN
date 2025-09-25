@@ -31,6 +31,24 @@ def test_library_size_normalize_basic():
     assert np.allclose(out.values, expected.values, rtol=1e-6, atol=1e-6)
 
 
+def test_library_size_normalize_handles_zero_library_rows():
+    df = pd.DataFrame(
+        [[0, 0, 0], [5, 5, 10]],
+        index=["zero", "nonzero"],
+        columns=["g1", "g2", "g3"],
+        dtype=float,
+    )
+
+    out = library_size_normalize(df, cpm_factor=1e6)
+
+    # The zero library row should remain zeros after normalisation and log1p,
+    # while the other row behaves as usual.
+    assert np.allclose(out.loc["zero"].values, 0.0)
+
+    expected_nonzero = np.log1p([1e6 * 5 / 20, 1e6 * 5 / 20, 1e6 * 10 / 20])
+    assert np.allclose(out.loc["nonzero"].values, expected_nonzero)
+
+
 def test_select_hvg_train_only_uses_train_variance():
     # Construct 4 samples (0..3), 4 genes (g0..g3)
     # Make g0 vary only in train, g1 vary only in val, g2 moderate in both, g3 least
